@@ -1,6 +1,17 @@
 import os
 import sys
 import time
+import collections
+from echoState import EchoStateNetwork
+
+# Real-time error plot — import with a fallback so the sim still runs if Tk is absent.
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")          # macOS-friendly; falls back automatically
+    import matplotlib.pyplot as plt
+    _MPLOT_OK = True
+except Exception:
+    _MPLOT_OK = False
 
 # Simbody (macOS) searches each PATH entry D for D/simbody-visualizer.app/Contents/MacOS/simbody-visualizer.
 # So PATH must list the folder that *contains* simbody-visualizer.app (e.g. .../out/build/default).
@@ -82,8 +93,27 @@ MOVE_BLEND_DURATION_S = 0.9  # nominal time for cubic blend toward current goal 
 REACH_TOL_M = 0.09  # hand-to-target distance (m) to count as "reached"
 MIN_TIME_BEFORE_REACH_S = 0.12  # avoid instant retarget at segment start
 BALL_RADIUS_M = 0.035  # red target sphere radius for API visualizer
+# Ghost stick-figure: how far the "lag ghost" trails the real arm (seconds).
+GHOST_LAG_SECONDS = 0.35
+GHOST_SPHERE_RADIUS_M = 0.018  # joint-marker sphere radius
+GHOST_COLOR = (0.0, 0.9, 0.9)  # cyan
+GHOST_OPACITY = 0.35
 # Simbody Ground mobilized body index for fixed-world decorations
 GROUND_MOBOD_IX = 0
+# ── ESN forward predictive model ──────────────────────────────────────────────
+# Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
+# Output          : predicted q_next[2] + qd_next[2]             =  4 features
+ESN_N_RESERVOIR   = 500          # reservoir nodes
+ESN_LEARNING_RATE = 5e-4         # delta-rule step size for online_update
+ESN_WASHOUT_STEPS = 100          # skip weight updates while reservoir settles
+# Ghost arm colour when showing ESN predictions (blue).
+GHOST_COLOR = (0.15, 0.45, 1.0)
+# Exponential moving-average smoothing on ghost joint positions.
+# α=1 → no smoothing (raw prediction); α=0.2 → heavy smoothing.
+GHOST_EMA_ALPHA = 0.25
+# Maximum allowed deviation (rad) between predicted q and actual q.
+# Clamps wild FK inputs when ESN weights are still near-zero.
+GHOST_MAX_Q_DEV_RAD = 0.4
 # Keep targets in an "easier" region so the arm doesn't have to reach extreme high poses.
 # Bounds are in Ground coordinates (meters).
 TARGET_X_RANGE_M = (0.05, 0.26)
@@ -178,8 +208,16 @@ stepsize = 0.005
 # ── Simulation step log (populated by on_simulation_step, saved at end) ──────
 _step_log: list[dict] = []
 
+# ── Ghost lag buffer (kept for reference, ESN ghost replaces its use) ─────────
+_lag_buffer: collections.deque = collections.deque()
 
-def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) -> None:
+# ── EMA state for ghost arm smoothing ─────────────────────────────────────────
+_ghost_ema: dict[str, np.ndarray | None] = {
+    "shoulder": None, "elbow": None, "hand": None,
+}
+
+
+def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) -> dict:
 	"""
 	Called every simulation timestep (stepsize s).
 
@@ -188,67 +226,137 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 	t : float
 	    Current simulation time (seconds).
 	state_snapshot : dict
-	    "q"                       – joint positions  {coord_name: rad}
-	    "qd"                      – joint velocities {coord_name: rad/s}
-	    "qdd"                     – joint accelerations {coord_name: rad/s²}
-	    "q_goal"                  – PID setpoint joint angles {coord_name: rad}
-	    "integral_err"            – PID integral accumulator {coord_name: rad·s}
-	    "end_effector_pos_ground" – hand XYZ in Ground frame (m),  np.ndarray
-	    "target_pos_ground"       – active target ball XYZ (m),    np.ndarray
-	    "dist_to_target_m"        – Euclidean hand-to-target (m)
-	    "targets_completed"       – targets reached so far (int)
+	    "q"                        – joint positions  {coord_name: rad}
+	    "qd"                       – joint velocities {coord_name: rad/s}
+	    "qdd"                      – joint accelerations {coord_name: rad/s²}
+	    "q_goal"                   – PID setpoint joint angles {coord_name: rad}
+	    "integral_err"             – PID integral accumulator {coord_name: rad·s}
+	    "end_effector_pos_ground"  – hand XYZ in Ground frame (m),  np.ndarray
+	    "shoulder_pos_ground"      – GH joint XYZ in Ground frame (m), np.ndarray
+	    "elbow_pos_ground"         – elbow joint XYZ in Ground frame (m), np.ndarray
+	    "target_pos_ground"        – active target ball XYZ (m),    np.ndarray
+	    "dist_to_target_m"         – Euclidean hand-to-target (m)
+	    "targets_completed"        – targets reached so far (int)
 	torque_commands : dict
 	    "shoulder_elv_torque"  – torque at shoulder elevation (Nm)
 	    "elbow_flexion_torque" – torque at elbow flexion (Nm)
+
+	Returns
+	-------
+	dict with keys:
+	    "ghost_shoulder", "ghost_elbow", "ghost_hand"  – np.ndarray[3] positions
+	    that drive the blue ESN-predicted ghost stick figure.
 	"""
-	q   = state_snapshot["q"]
-	qd  = state_snapshot["qd"]
-	qdd = state_snapshot.get("qdd", {})
-	ee  = state_snapshot["end_effector_pos_ground"]
-	tgt = state_snapshot["target_pos_ground"]
+	global _esn_r, _esn_r_at_pred, _esn_last_pred, _esn_step_count
 
-	# Next STEP:
-	'''
-		Take in current shoulder position, velocity, and acceleration with torque commands
-		Predict next time step sensory. 
+	q      = state_snapshot["q"]
+	qd     = state_snapshot["qd"]
+	qdd    = state_snapshot.get("qdd", {cn: 0.0 for cn in coord_names})
+	q_goal = state_snapshot["q_goal"]
+	tau    = {cn: torque_commands.get(f"{cn}_torque", 0.0) for cn in coord_names}
 
-		Use a forward PC, using t to predict t+1, when t+1, run weight update for f(t)-->(t+1)
-		measure free energy to determine if the model is learning
+	# ── Step ESN reservoir with current state + motor commands ────────────────
+	u      = _build_esn_input_vec(q, qd, qdd, tau, q_goal)
+	_esn_r = _esn.step(_esn_r, u)
 
-		subtract predictions from actual to determine error. 
+	# Store reservoir state at prediction time for the after-step weight update.
+	_esn_r_at_pred = _esn_r.copy()
 
-		after some number of reaches, add a weight to the arm and see how it reacts in free energy
-	'''
+	# One-step-ahead prediction: [q_shoulder_next, q_elbow_next, qd_shoulder_next, qd_elbow_next]
+	_esn_last_pred = _esn._readout(_esn_r).copy()
+	_esn_step_count += 1
 
-	...
-	# _step_log.append({
-	# 	"t_s":                      t,
-	# 	# ── Joint positions (rad) ─────────────────────────────────────────────
-	# 	"shoulder_elv_rad":         q.get("shoulder_elv",   float("nan")),
-	# 	"elbow_flexion_rad":        q.get("elbow_flexion",  float("nan")),
-	# 	# ── Joint velocities (rad/s) ──────────────────────────────────────────
-	# 	"shoulder_elv_vel_rad_s":   qd.get("shoulder_elv",  float("nan")),
-	# 	"elbow_flexion_vel_rad_s":  qd.get("elbow_flexion", float("nan")),
-	# 	# ── Joint accelerations (rad/s²) ──────────────────────────────────────
-	# 	"shoulder_elv_acc_rad_s2":  qdd.get("shoulder_elv",  float("nan")),
-	# 	"elbow_flexion_acc_rad_s2": qdd.get("elbow_flexion", float("nan")),
-	# 	# ── PID setpoints (rad) ───────────────────────────────────────────────
-	# 	"shoulder_elv_goal_rad":    state_snapshot["q_goal"].get("shoulder_elv",  float("nan")),
-	# 	"elbow_flexion_goal_rad":   state_snapshot["q_goal"].get("elbow_flexion", float("nan")),
-	# 	# ── Motor commands (Nm) ───────────────────────────────────────────────
-	# 	"shoulder_elv_torque_Nm":   torque_commands.get("shoulder_elv_torque",  float("nan")),
-	# 	"elbow_flexion_torque_Nm":  torque_commands.get("elbow_flexion_torque", float("nan")),
-	# 	# ── End-effector position (m) ─────────────────────────────────────────
-	# 	"ee_x_m":                   float(ee[0]),
-	# 	"ee_y_m":                   float(ee[1]),
-	# 	"ee_z_m":                   float(ee[2]),
-	# 	# ── Target position (m) ───────────────────────────────────────────────
-	# 	"target_x_m":               float(tgt[0]),
-	# 	"target_y_m":               float(tgt[1]),
-	# 	"target_z_m":               float(tgt[2]),
-	# 	"dist_to_target_m":         state_snapshot.get("dist_to_target_m", float("nan")),
-	# 	"targets_completed":        int(state_snapshot.get("targets_completed", 0)),
-	# })
+	# ── Forward kinematics: predicted q → Ground-frame 3D joint positions ────
+	# Clamp predicted joint angles to stay within GHOST_MAX_Q_DEV_RAD of the
+	# actual current q.  This prevents wild FK results when W_out is near-zero
+	# (early training) or immediately after a new target fires and q_goal jumps.
+	q_actual_arr = np.array([q.get(cn, 0.0) for cn in coord_names])
+	pred_q_arr   = np.clip(
+		_esn_last_pred[:len(coord_names)],
+		q_actual_arr - GHOST_MAX_Q_DEV_RAD,
+		q_actual_arr + GHOST_MAX_Q_DEV_RAD,
+	)
+	raw_shoulder, raw_elbow, raw_hand = _esn_fk(pred_q_arr)
+
+	# ── Exponential moving-average smoothing (prevents visual snapping) ───────
+	α = GHOST_EMA_ALPHA
+	def _ema(key: str, raw: np.ndarray) -> np.ndarray:
+		if _ghost_ema[key] is None:
+			_ghost_ema[key] = raw.copy()
+		else:
+			_ghost_ema[key] = α * raw + (1.0 - α) * _ghost_ema[key]
+		return _ghost_ema[key]
+
+	ghost_shoulder = _ema("shoulder", raw_shoulder)
+	ghost_elbow    = _ema("elbow",    raw_elbow)
+	ghost_hand     = _ema("hand",     raw_hand)
+
+	return {
+		"ghost_shoulder": ghost_shoulder,
+		"ghost_elbow":    ghost_elbow,
+		"ghost_hand":     ghost_hand,
+	}
+
+
+def after_simulation_step(
+	t_prev: float,
+	t_now: float,
+	prev_state_snapshot: dict,
+	prev_torque_commands: dict,
+	current_state_snapshot: dict,
+) -> None:
+	"""
+	Called immediately after each integration step (t_prev → t_now).
+
+	Compares the ESN's one-step-ahead prediction (made in on_simulation_step at
+	t_prev) against the actual observed state at t_now, then applies a delta-rule
+	weight update to reduce the error.
+
+	Parameters
+	----------
+	t_prev               : simulation time at start of step
+	t_now                : simulation time at end of step (= t_prev + stepsize)
+	prev_state_snapshot  : full state dict at t_prev
+	prev_torque_commands : torques applied during this step (Nm)
+	current_state_snapshot : observed ground-truth state at t_now
+	    "q"   – {coord_name: rad}
+	    "qd"  – {coord_name: rad/s}
+	    "end_effector_pos_ground" – np.ndarray
+	"""
+	# Skip weight updates during the initial washout period while the reservoir
+	# is still settling from its zero initial state.
+	if _esn_step_count <= ESN_WASHOUT_STEPS:
+		return
+
+	# Ground-truth next state
+	q_now  = current_state_snapshot["q"]
+	qd_now = current_state_snapshot["qd"]
+	actual = _build_esn_target_vec(q_now, qd_now)   # shape (4,)
+
+	# Prediction error: positive → ESN undershot, negative → overshot.
+	error = actual - _esn_last_pred                  # shape (4,)
+
+	# Delta rule: W_out += lr · error ⊗ φ(r_at_pred)
+	_esn.online_update(_esn_r_at_pred, error, learning_rate=ESN_LEARNING_RATE)
+
+	# ── Real-time error plot ──────────────────────────────────────────────────
+	n = len(coord_names)
+	_esn_err_t.append(t_now)
+	_esn_err_q.append(float(np.linalg.norm(error[:n])))    # ||Δq||  (rad)
+	_esn_err_qd.append(float(np.linalg.norm(error[n:])))   # ||Δqd|| (rad/s)
+
+	if _MPLOT_OK and _esn_step_count % 40 == 0:
+		_esn_line_q.set_xdata(_esn_err_t)
+		_esn_line_q.set_ydata(_esn_err_q)
+		_esn_line_qd.set_xdata(_esn_err_t)
+		_esn_line_qd.set_ydata(_esn_err_qd)
+		_esn_err_ax.relim()
+		_esn_err_ax.autoscale_view(scalex=True, scaley=True)
+		try:
+			_esn_err_fig.canvas.draw_idle()
+			_esn_err_fig.canvas.flush_events()
+		except Exception:
+			pass
 
 
 def _sync_red_target_ball(model: osim.Model, target_xyz: np.ndarray, viz_ball: dict) -> None:
@@ -295,6 +403,155 @@ def _sync_red_target_ball(model: osim.Model, target_xyz: np.ndarray, viz_ball: d
 			pass
 
 
+def _bone_transform(p1: np.ndarray, p2: np.ndarray) -> tuple[osim.Transform, float]:
+	"""
+	Return (transform, half_length) to place a Y-axis-aligned Simbody cylinder
+	so that it runs from p1 to p2 in Ground frame.
+
+	Simbody cylinders are aligned with their local Y axis by default.  We build a
+	rotation that maps Y → (p2−p1)/|p2−p1| and translate to the segment midpoint.
+	Only setTransform (base-class method) is needed for updates, so this approach
+	works even when updDecoration() returns the opaque DecorativeGeometry base type.
+	"""
+	d       = p2 - p1
+	length  = float(np.linalg.norm(d))
+	half_h  = max(length / 2.0, 1e-6)
+
+	if length < 1e-6:
+		return osim.Transform(), half_h
+
+	d_hat = d / length
+	y     = np.array([0.0, 1.0, 0.0])
+	cross = np.cross(y, d_hat)
+	cross_n = float(np.linalg.norm(cross))
+	dot     = float(np.dot(y, d_hat))
+
+	if cross_n < 1e-6:
+		# Parallel or anti-parallel to Y
+		rot = osim.Rotation() if dot > 0 else osim.Rotation(math.pi, osim.Vec3(1, 0, 0))
+	else:
+		angle = math.acos(max(-1.0, min(1.0, dot)))
+		ax    = cross / cross_n
+		rot   = osim.Rotation(angle, osim.Vec3(float(ax[0]), float(ax[1]), float(ax[2])))
+
+	mid = (p1 + p2) / 2.0
+	xf  = osim.Transform(rot, osim.Vec3(float(mid[0]), float(mid[1]), float(mid[2])))
+	return xf, half_h
+
+
+# Radius (m) for the thin bone cylinders on the ghost stick figure.
+_GHOST_BONE_RADIUS_M = 0.007
+
+
+def _sync_ghost_stick_figure(
+	model: osim.Model,
+	shoulder_pos: np.ndarray,
+	elbow_pos: np.ndarray,
+	hand_pos: np.ndarray,
+	viz_ghost: dict,
+) -> None:
+	"""
+	Draw/update the cyan lag-ghost stick figure.
+
+	Geometry
+	--------
+	• 3 DecorativeSpheres at the shoulder / elbow / hand joint positions.
+	• 2 thin DecorativeCylinders connecting shoulder→elbow and elbow→hand.
+
+	Why cylinders instead of DecorativeLines
+	-----------------------------------------
+	updDecoration() returns the *base* DecorativeGeometry type.  setTransform() is
+	defined on the base class and reliably updates position + orientation every frame.
+	DecorativeLine.setPoint1/setPoint2 are *derived-class* methods and are not
+	reachable through the base pointer, so line endpoint updates silently fail.
+	A cylinder needs only setTransform — the same mechanism that already works for
+	the red target ball.  Bone lengths are constant (rigid arm), so we compute the
+	half-height once at creation and only refresh the transform each frame.
+
+	viz_ghost keys (populated on first call)
+	-----------------------------------------
+	idxs      : dict[str, int]               – decoration indices
+	refs      : dict[str, DecorativeGeometry] – stored handles at creation
+	half_lens : dict[str, float]             – fixed bone half-lengths (m)
+	sph_r     : float                        – sphere radius (m)
+	"""
+	if not USE_VISUALIZER:
+		return
+	try:
+		viz = model.getVisualizer().getSimbodyVisualizer()
+	except RuntimeError:
+		return
+
+	color   = osim.Vec3(*GHOST_COLOR)
+	opacity = GHOST_OPACITY
+	sph_r   = float(viz_ghost["sph_r"])
+
+	def _sphere_xf(pos: np.ndarray) -> osim.Transform:
+		xf = osim.Transform()
+		xf.setP(osim.Vec3(float(pos[0]), float(pos[1]), float(pos[2])))
+		return xf
+
+	joint_items = [
+		("shoulder", shoulder_pos),
+		("elbow",    elbow_pos),
+		("hand",     hand_pos),
+	]
+	bone_items = [
+		("bone_se", shoulder_pos, elbow_pos),
+		("bone_eh", elbow_pos,    hand_pos),
+	]
+
+	def _add_and_store(geo, xf, idxs, refs, name):
+		idx = int(viz.getNumDecorations())
+		viz.addDecoration(GROUND_MOBOD_IX, xf, geo)
+		idxs[name] = idx
+		refs[name] = viz.updDecoration(idx)
+
+	def _update(name, xf, idxs, refs):
+		try:
+			refs[name].setTransform(xf)
+		except Exception:
+			pass
+		try:
+			viz.updDecoration(idxs[name]).setTransform(xf)
+		except Exception:
+			pass
+
+	if viz_ghost["idxs"] is None:
+		idxs: dict[str, int] = {}
+		refs: dict = {}
+		half_lens: dict[str, float] = {}
+
+		for name, pos in joint_items:
+			sph = osim.DecorativeSphere(sph_r)
+			sph.setColor(color)
+			sph.setOpacity(opacity)
+			_add_and_store(sph, _sphere_xf(pos), idxs, refs, name)
+
+		for name, p1, p2 in bone_items:
+			xf, half_h = _bone_transform(p1, p2)
+			half_lens[name] = half_h
+			cyl = osim.DecorativeCylinder(_GHOST_BONE_RADIUS_M, half_h)
+			cyl.setColor(color)
+			cyl.setOpacity(opacity)
+			_add_and_store(cyl, xf, idxs, refs, name)
+
+		viz_ghost["idxs"]      = idxs
+		viz_ghost["refs"]      = refs
+		viz_ghost["half_lens"] = half_lens
+
+	else:
+		idxs      = viz_ghost["idxs"]
+		refs      = viz_ghost["refs"]
+
+		for name, pos in joint_items:
+			_update(name, _sphere_xf(pos), idxs, refs)
+
+		for name, p1, p2 in bone_items:
+			xf, _ = _bone_transform(p1, p2)
+			_update(name, xf, idxs, refs)
+
+
 def _pick_end_effector_body(model: osim.Model) -> osim.Body:
 	bodies = model.getBodySet()
 	# Prefer something that looks like a hand/wrist/end-effector.
@@ -306,6 +563,17 @@ def _pick_end_effector_body(model: osim.Model) -> osim.Body:
 				return b
 	# Fallback: last non-ground body.
 	return bodies.get(bodies.getSize() - 1)
+
+
+def _find_body_containing(model: osim.Model, substrings: list[str]) -> osim.Body | None:
+	"""Return the first Body whose name contains any of the given substrings (case-insensitive)."""
+	bodies = model.getBodySet()
+	for sub in substrings:
+		for i in range(bodies.getSize()):
+			b = bodies.get(i)
+			if sub.lower() in b.getName().lower():
+				return b
+	return None
 
 
 def _get_end_effector_position_in_ground(model: osim.Model, state: osim.State, ee_body: osim.Body) -> np.ndarray:
@@ -374,32 +642,69 @@ def sample_one_reachable_target(
 	coord_names: list[str],
 	rng: np.random.Generator,
 	current_ee_pos: np.ndarray | None = None,
-) -> np.ndarray:
-	"""Single random reachable end-effector position (Ground)."""
+) -> tuple[np.ndarray, dict[str, float]]:
+	"""
+	Returns (target_pos, q_goal) where:
+	  • target_pos  – 3-D end-effector position in Ground (m)
+	  • q_goal      – the exact joint angles that produce target_pos via FK
+
+	Because q_goal comes directly from FK (not from a separate IK solve), the
+	target is *guaranteed* reachable.  The caller can use q_goal as the PID
+	setpoint immediately without running solve_ik_2dof_numeric — which avoids
+	the failure mode where IK starts from a distant warm-start and diverges.
+
+	Fallback order when no fully-valid candidate is found within MAX_TRIES:
+	  1. Best in-box position (even if too close to current EE).
+	  2. The last sampled position (prevents returning None).
+	"""
 	ee_body = _pick_end_effector_body(model)
 	coord_ranges = _get_coord_ranges(coords, coord_names)
 	s_tmp = _copy_state_for_kinematics(state)
 	needs_restore = s_tmp is state
 	if needs_restore:
 		q_save = {cn: coords.get(cn).getValue(state) for cn in coord_names}
-	pos = None
+
+	best_pos: np.ndarray | None = None
+	best_q:   dict[str, float] | None = None
+	last_pos: np.ndarray | None = None
+	last_q:   dict[str, float] = {}
+
 	for _ in range(TARGET_SAMPLE_MAX_TRIES):
+		q_sample: dict[str, float] = {}
 		for name in coord_names:
 			lo, hi = coord_ranges[name]
-			coords.get(name).setValue(s_tmp, float(rng.uniform(lo, hi)))
+			v = float(rng.uniform(lo, hi))
+			q_sample[name] = v
+			coords.get(name).setValue(s_tmp, v)
+
 		p = _get_end_effector_position_in_ground(model, s_tmp, ee_body)
+		last_pos = p
+		last_q   = q_sample
+
 		x_ok = TARGET_X_RANGE_M[0] <= float(p[0]) <= TARGET_X_RANGE_M[1]
 		y_ok = TARGET_Y_RANGE_M[0] <= float(p[1]) <= TARGET_Y_RANGE_M[1]
 		z_ok = TARGET_Z_RANGE_M[0] <= float(p[2]) <= TARGET_Z_RANGE_M[1]
+
 		if x_ok and y_ok and z_ok:
-			if current_ee_pos is None or float(np.linalg.norm(p - current_ee_pos)) >= MIN_TARGET_SEPARATION_M:
-				pos = p
+			# Always keep the latest in-box candidate as a fallback.
+			best_pos = p
+			best_q   = dict(q_sample)
+			sep_ok = (
+				current_ee_pos is None
+				or float(np.linalg.norm(p - current_ee_pos)) >= MIN_TARGET_SEPARATION_M
+			)
+			if sep_ok:
+				# Found a well-separated, in-box, guaranteed-reachable target.
 				break
-		pos = p
+
 	if needs_restore:
 		for cn in coord_names:
 			coords.get(cn).setValue(state, q_save[cn])
-	return np.array(pos, dtype=float)
+
+	# Return best candidate found (prefer separated in-box > any in-box > last sample).
+	if best_pos is not None:
+		return np.array(best_pos, dtype=float), best_q  # type: ignore[return-value]
+	return np.array(last_pos, dtype=float), last_q
 
 
 def solve_ik_2dof_numeric(
@@ -645,18 +950,162 @@ ee_pos  = _get_end_effector_position_in_ground(model, state, ee_body)
 
 # ALL IK / target sampling goes through the dedicated _ik_* objects so the
 # simulation state is never externally modified.
-target_pos_seg = sample_one_reachable_target(
+# q_goal_seg comes directly from the FK-generating joint angles — guaranteed reachable.
+target_pos_seg, q_goal_seg = sample_one_reachable_target(
 	_ik_model, _ik_state, _ik_coords, coord_names, rng, current_ee_pos=ee_pos
 )
-q_goal_seg = solve_ik_2dof_numeric(
-	_ik_model, _ik_state, _ik_coords, coord_names, target_pos_seg,
-	apply_to_state=False
-)
-# Warm-start seed so next IK call begins near this solution.
 for _cn in coord_names:
 	_ik_coords.get(_cn).setValue(_ik_state, q_goal_seg[_cn])
 
-viz_ball: dict = {"idx": None, "ref": None, "radius": BALL_RADIUS_M}
+viz_ball: dict  = {"idx": None, "ref": None, "radius": BALL_RADIUS_M}
+viz_ghost: dict = {"idxs": None, "refs": None, "sph_r": GHOST_SPHERE_RADIUS_M}
+
+# Bodies used to compute ghost joint positions each frame.
+# humerus origin  ≈ GH / shoulder joint centre.
+# ulna origin     ≈ elbow joint centre (radial head / trochlear notch).
+# ee_body already found above  ≈ hand / wrist.
+_ghost_shoulder_body = _find_body_containing(model, ["humer"])
+_ghost_elbow_body    = _find_body_containing(model, ["ulna", "radius"])
+# Diagnostic: let the user know which bodies were found.
+print(
+	f"[Ghost] shoulder body = {_ghost_shoulder_body.getName() if _ghost_shoulder_body else 'NOT FOUND'}, "
+	f"elbow body = {_ghost_elbow_body.getName() if _ghost_elbow_body else 'NOT FOUND'}",
+	flush=True,
+)
+
+# ── ESN input / target vector helpers ────────────────────────────────────────
+# These reference coord_names (defined above) at call time — no forward-ref issue.
+
+def _build_esn_input_vec(
+	q: dict, qd: dict, qdd: dict, tau: dict, q_goal: dict,
+) -> np.ndarray:
+	"""Flatten (q, qd, qdd, tau, q_goal) for each coord → length-10 ESN input."""
+	return np.array(
+		[q.get(cn, 0.0)      for cn in coord_names] +
+		[qd.get(cn, 0.0)     for cn in coord_names] +
+		[qdd.get(cn, 0.0)    for cn in coord_names] +
+		[tau.get(cn, 0.0)    for cn in coord_names] +
+		[q_goal.get(cn, 0.0) for cn in coord_names],
+		dtype=float,
+	)
+
+
+def _build_esn_target_vec(q: dict, qd: dict) -> np.ndarray:
+	"""Flatten actual (q_next, qd_next) → length-4 ESN target."""
+	return np.array(
+		[q.get(cn, 0.0)  for cn in coord_names] +
+		[qd.get(cn, 0.0) for cn in coord_names],
+		dtype=float,
+	)
+
+
+# ── ESN instance ──────────────────────────────────────────────────────────────
+_ESN_N_IN  = len(coord_names) * 5   # q + qd + qdd + tau + q_goal = 10
+_ESN_N_OUT = len(coord_names) * 2   # q_next + qd_next = 4
+
+_esn = EchoStateNetwork(
+	n_inputs        = _ESN_N_IN,
+	n_reservoir     = ESN_N_RESERVOIR,
+	n_outputs       = _ESN_N_OUT,
+	spectral_radius = 0.95,
+	connectivity    = 0.1,
+	leak_rate       = 0.3,
+	input_scaling   = 1.0,
+	bias_scaling    = 0.1,
+	regularization  = 1e-6,
+	seed            = 42,
+)
+# W_out starts at zero — online_update builds it up from scratch each episode.
+_esn.W_out = np.zeros((_ESN_N_OUT, 2 * ESN_N_RESERVOIR + 1))
+
+# ESN runtime state shared between on_simulation_step and after_simulation_step.
+_esn_r:          np.ndarray = np.zeros(ESN_N_RESERVOIR)  # current reservoir state
+_esn_r_at_pred:  np.ndarray = np.zeros(ESN_N_RESERVOIR)  # state at last prediction
+_esn_last_pred:  np.ndarray = np.zeros(_ESN_N_OUT)        # last prediction vector
+_esn_step_count: int        = 0                            # steps elapsed
+
+# ── Dedicated FK state for ESN ghost arm ──────────────────────────────────────
+# We need a state separate from _ik_state so FK evaluation (predicted q → 3D)
+# does not clobber the IK warm-start values used by solve_ik_2dof_numeric.
+_esn_fk_state  = _ik_model.initSystem()
+_esn_fk_coords = _ik_model.updCoordinateSet()
+for _i in range(_esn_fk_coords.getSize()):
+	_c = _esn_fk_coords.get(_i)
+	if _c.getName() in _DRIFT_DOFS_TO_LOCK:
+		try:
+			_c.setLocked(_esn_fk_state, True)
+		except Exception:
+			pass
+
+# Bodies in the IK model used to convert predicted joint angles → Ground positions.
+_esn_fk_shoulder_body = _find_body_containing(_ik_model, ["humer"])
+_esn_fk_elbow_body    = _find_body_containing(_ik_model, ["ulna", "radius"])
+_esn_fk_hand_body     = _pick_end_effector_body(_ik_model)
+
+
+def _esn_fk(q_pred: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Forward kinematics for the ESN ghost arm.
+
+	Sets the predicted joint angles on the dedicated FK state, realizes position,
+	and returns (shoulder_pos, elbow_pos, hand_pos) in Ground frame (metres).
+	"""
+	for i, cn in enumerate(coord_names):
+		try:
+			_esn_fk_coords.get(cn).setValue(_esn_fk_state, float(q_pred[i]))
+		except Exception:
+			pass
+	try:
+		_ik_model.realizePosition(_esn_fk_state)
+	except Exception:
+		return np.zeros(3), np.zeros(3), np.zeros(3)
+
+	def _body_pos(body: osim.Body | None) -> np.ndarray:
+		if body is None:
+			return np.zeros(3)
+		p = body.findStationLocationInGround(_esn_fk_state, osim.Vec3(0, 0, 0))
+		return np.array([p.get(0), p.get(1), p.get(2)], dtype=float)
+
+	return (
+		_body_pos(_esn_fk_shoulder_body),
+		_body_pos(_esn_fk_elbow_body),
+		_body_pos(_esn_fk_hand_body),
+	)
+
+
+print(
+	f"[ESN] reservoir={ESN_N_RESERVOIR}  n_in={_ESN_N_IN}  n_out={_ESN_N_OUT}  "
+	f"lr={ESN_LEARNING_RATE}  washout={ESN_WASHOUT_STEPS} steps",
+	flush=True,
+)
+
+# ── Real-time error plot ───────────────────────────────────────────────────────
+_esn_err_t:   list[float] = []
+_esn_err_q:   list[float] = []
+_esn_err_qd:  list[float] = []
+
+if _MPLOT_OK:
+	plt.ion()
+	_esn_err_fig, _esn_err_ax = plt.subplots(figsize=(9, 4))
+	_esn_err_fig.canvas.manager.set_window_title("ESN Online Learning — Prediction Error")
+	_esn_line_q,  = _esn_err_ax.plot([], [], lw=1.2, color="royalblue",  label="||Δq||  (rad)")
+	_esn_line_qd, = _esn_err_ax.plot([], [], lw=1.2, color="darkorange", label="||Δqd|| (rad/s)", alpha=0.7)
+	_esn_err_ax.set_xlabel("Simulation time (s)")
+	_esn_err_ax.set_ylabel("Prediction error magnitude")
+	_esn_err_ax.set_title("ESN one-step-ahead error  (↓ = learning)")
+	_esn_err_ax.legend(loc="upper right")
+	_esn_err_ax.set_xlim(0, MAX_SIM_TIME_S)
+	_esn_err_fig.tight_layout()
+	try:
+		_esn_err_fig.canvas.draw()
+		_esn_err_fig.canvas.flush_events()
+	except Exception:
+		pass
+	print("[ESN] Matplotlib error window opened.", flush=True)
+else:
+	# Placeholders so after_simulation_step references don't raise NameError.
+	_esn_err_fig = _esn_err_ax = _esn_line_q = _esn_line_qd = None
+	print("[ESN] Matplotlib unavailable — error plot disabled.", flush=True)
+
 targets_completed = 0
 dist = float("inf")
 move_t0 = float(state.getTime())
@@ -681,7 +1130,8 @@ brain = osim.PrescribedController.safeDownCast(model.getControllerSet().get(0))
 functionSet = brain.get_ControlFunctions()
 
 while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
-	t_next = float(state.getTime()) + stepsize
+	t_cur  = float(state.getTime())          # time at start of this step (= t_prev for the after-hook)
+	t_next = t_cur + stepsize
 
 	# ── Read current joint state ──────────────────────────────────────────────
 	q_cur  = {cn: coords.get(cn).getValue(state)      for cn in coord_names}
@@ -712,6 +1162,17 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	# ── User hook ─────────────────────────────────────────────────────────────
 	ee_pos = _get_end_effector_position_in_ground(model, state, ee_body)
 
+	# Shoulder and elbow joint positions for the ghost stick figure.
+	# _get_end_effector_position_in_ground works on any body, not just the EE.
+	shoulder_pos = (
+		_get_end_effector_position_in_ground(model, state, _ghost_shoulder_body)
+		if _ghost_shoulder_body is not None else ee_pos
+	)
+	elbow_pos = (
+		_get_end_effector_position_in_ground(model, state, _ghost_elbow_body)
+		if _ghost_elbow_body is not None else ee_pos
+	)
+
 	# Compute joint accelerations: realizeAcceleration fills in qdd given the
 	# current position, velocity, and already-applied torques (tau_cmd above).
 	qdd_cur: dict[str, float] = {}
@@ -729,52 +1190,74 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 		"q_goal":                  dict(q_goal_seg),
 		"integral_err":            dict(integral_err),
 		"end_effector_pos_ground": ee_pos,
+		"shoulder_pos_ground":     shoulder_pos,
+		"elbow_pos_ground":        elbow_pos,
 		"target_pos_ground":       target_pos_seg.copy(),
 		"targets_completed":       targets_completed,
 		"dist_to_target_m":        dist,
 	}
-	on_simulation_step(float(state.getTime()), state_snapshot, {f"{cn}_torque": tau_cmd[cn] for cn in coord_names})
+	ghost_positions = on_simulation_step(
+		float(state.getTime()), state_snapshot,
+		{f"{cn}_torque": tau_cmd[cn] for cn in coord_names},
+	)
 
 	# ── Integrate one step ────────────────────────────────────────────────────
 	state = manager.integrate(t_next)
 
-	# ── Post-step reach check (uses post-integration state) ───────────────────
+	# ── Post-step: build observed state at t_now, call after_simulation_step ──
+	q_now  = {cn: coords.get(cn).getValue(state)      for cn in coord_names}
+	qd_now = {cn: coords.get(cn).getSpeedValue(state) for cn in coord_names}
 	ee_pos = _get_end_effector_position_in_ground(model, state, ee_body)
+
+	after_simulation_step(
+		t_cur,
+		float(state.getTime()),
+		state_snapshot,
+		{f"{cn}_torque": tau_cmd[cn] for cn in coord_names},
+		{
+			"q":                       q_now,
+			"qd":                      qd_now,
+			"end_effector_pos_ground": ee_pos,
+		},
+	)
+
+	# ── Post-step reach check (reuses ee_pos computed above) ─────────────────
 	dist   = float(np.linalg.norm(ee_pos - target_pos_seg))
 	t_rel_done = float(state.getTime()) - move_t0
 	arm_settled = all(abs(qd_cur[cn]) < 0.6 for cn in coord_names)
 	if t_rel_done >= MIN_TIME_BEFORE_REACH_S and dist < REACH_TOL_M and arm_settled:
 		targets_completed += 1
 		old_target = target_pos_seg.copy()
-		target_pos_seg = sample_one_reachable_target(
+		# q_goal_seg from sampling = exact FK-generating angles → always reachable, residual = 0.
+		target_pos_seg, q_goal_seg = sample_one_reachable_target(
 			_ik_model, _ik_state, _ik_coords, coord_names, rng, current_ee_pos=ee_pos
 		)
-		q_goal_seg = solve_ik_2dof_numeric(
-			_ik_model, _ik_state, _ik_coords, coord_names, target_pos_seg,
-			apply_to_state=False
-		)
-		# ── Warm-start: seed next IK from this solution so it converges faster ──
 		for _cn in coord_names:
 			_ik_coords.get(_cn).setValue(_ik_state, q_goal_seg[_cn])
-		# ────────────────────────────────────────────────────────────────────────
 		move_t0 = float(state.getTime())
 		integral_err = {cn: 0.0 for cn in coord_names}   # reset to avoid windup fighting new goal
 		new_dist = float(np.linalg.norm(ee_pos - target_pos_seg))
-		# Verify IK residual by FK on the IK model.
-		_ik_model.realizePosition(_ik_state)
-		_ik_ee = _get_end_effector_position_in_ground(_ik_model, _ik_state, _pick_end_effector_body(_ik_model))
-		_ik_residual = float(np.linalg.norm(_ik_ee - target_pos_seg))
 		print(
 			f"  ✓ target {targets_completed} reached at t={state.getTime():.2f}s "
 			f"(dist={dist:.3f}m to old ball)  "
 			f"→ NEW target ({target_pos_seg[0]:.2f},{target_pos_seg[1]:.2f},{target_pos_seg[2]:.2f})  "
-			f"IK_residual={_ik_residual:.4f}m  dist_to_new={new_dist:.3f}m",
+			f"q_goal={{{', '.join(f'{k}: {v:.3f}' for k,v in q_goal_seg.items())}}}  "
+			f"dist_to_new={new_dist:.3f}m",
 			flush=True,
 		)
 
-	# ── Red ball: sync EVERY frame so the decoration stays current ───────────
-	# Called before show() so the visualizer renders the updated position.
+	# ── Red ball + ghost stick figure: sync EVERY frame ─────────────────────
+	# Both are called before show() so the visualizer renders updated positions.
 	_sync_red_target_ball(model, target_pos_seg, viz_ball)
+
+	if ghost_positions is not None:
+		_sync_ghost_stick_figure(
+			model,
+			ghost_positions["ghost_shoulder"],
+			ghost_positions["ghost_elbow"],
+			ghost_positions["ghost_hand"],
+			viz_ghost,
+		)
 
 	# ── Visualizer show ───────────────────────────────────────────────────────
 	if USE_VISUALIZER:
