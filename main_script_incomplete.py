@@ -125,7 +125,7 @@ GROUND_MOBOD_IX = 0
 # Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
 # Output          : predicted q_next[2] + qd_next[2]             =  4 features
 ESN_N_RESERVOIR   = 2_000         # reservoir nodes
-ESN_WASHOUT_STEPS = 100           # skip updates while reservoir settles
+ESN_WASHOUT_STEPS = 0           # skip updates while reservoir settles
 # ── Online RLS (Recursive Least Squares) parameters ───────────────────────────
 # W_out is updated after EVERY step via the Sherman-Morrison rank-1 update on
 # P = (ΦᵀΦ)⁻¹, giving the exact optimal readout at all times with no batch solve.
@@ -144,7 +144,11 @@ ESN_PREDICT_HORIZON   = 1     # steps ahead to predict (K) — 1 × 0.005 s = 5 
 ESN_CLOSED_LOOP_REACHES = 10  # switch to closed-loop after this many reaches (0 = never)
 # Per-target washout: skip RLS updates for this many steps after a new target so
 # the high-velocity transition spike doesn't corrupt P.
-ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
+# On each new target: pre-warm reservoir by driving it N steps in-place with the
+# current arm state + new goal before trusting predictions.  During warmup the ghost
+# is pinned to the real arm and RLS is suppressed.  Replaces the old hard zero-reset.
+ESN_TARGET_WARMUP_STEPS   = 10   # reservoir pre-warm steps (100 × 0.005 s = 0.5 s)
+ESN_TARGET_WASHOUT_STEPS  = ESN_TARGET_WARMUP_STEPS  # alias used elsewhere
 # Plot update rate (green milestone lines are now replaced by convergence line only).
 ESN_PLOT_INTERVAL = 40             # redraw error plot every N steps
 # Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
@@ -1195,6 +1199,7 @@ _esn_err_ema_q:  float = 1.0
 # Per-target washout counter: counts down from ESN_TARGET_WASHOUT_STEPS after each
 # new target.  RLS updates are suppressed while this is > 0.
 _esn_target_washout_rem: int = 0
+_esn_warmup_rem: int         = 0   # steps remaining in reservoir pre-warm (sim paused)
 
 # ── Online RLS state ──────────────────────────────────────────────────────────
 # P  : running estimate of (ΦᵀΦ)⁻¹, shape (N_aug, N_aug).
@@ -1466,13 +1471,34 @@ print(
 brain = osim.PrescribedController.safeDownCast(model.getControllerSet().get(0))
 functionSet = brain.get_ControlFunctions()
 
+# Last known PID torques and acceleration — carried into warmup so the ESN
+# sees a continuous input rather than a sudden drop to zeros.
+_warmup_tau_cmd  = {cn: 0.0 for cn in coord_names}
+_warmup_qdd_cur  = {cn: 0.0 for cn in coord_names}
+
 while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
-	t_cur  = float(state.getTime())          # time at start of this step (= t_prev for the after-hook)
+	t_cur  = float(state.getTime())
 	t_next = t_cur + stepsize
 
 	# ── Read current joint state ──────────────────────────────────────────────
 	q_cur  = {cn: coords.get(cn).getValue(state)      for cn in coord_names}
 	qd_cur = {cn: coords.get(cn).getSpeedValue(state) for cn in coord_names}
+
+	# ── Reservoir pre-warm: freeze physics, step ESN, skip everything else ────
+	# Use the last real tau + qdd so the input is continuous — no sudden zero-drop.
+	if _esn_warmup_rem > 0:
+		_u_warm = _build_esn_input_vec(
+			q_cur, qd_cur,
+			_warmup_qdd_cur,    # last measured acceleration
+			_warmup_tau_cmd,    # last PID torques
+			q_goal_seg,         # NEW goal already in place
+		)
+		_esn_r = _esn.step(_esn_r, _u_warm)
+		_esn_warmup_rem -= 1
+		if _esn_warmup_rem == 0:
+			integral_err = {cn: 0.0 for cn in coord_names}
+			print("  [ESN] reservoir warm — simulation resuming", flush=True)
+		continue   # skip PID, physics, after_simulation_step
 
 	# ── PID controller ────────────────────────────────────────────────────────
 	# τ = Kp·(q_goal−q) + Ki·∫(q_goal−q)dt − Kd·q̇
@@ -1540,6 +1566,10 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	except Exception:
 		qdd_cur = {cn: float("nan") for cn in coord_names}
 
+	# Save for use in the next warmup window so input stays continuous.
+	_warmup_tau_cmd = dict(tau_cmd)
+	_warmup_qdd_cur = {cn: v for cn, v in qdd_cur.items() if not (isinstance(v, float) and v != v)}
+
 	state_snapshot = {
 		"q":                       q_cur,
 		"qd":                      qd_cur,
@@ -1593,12 +1623,15 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 			_ik_coords.get(_cn).setValue(_ik_state, q_goal_seg[_cn])
 		move_t0 = float(state.getTime())
 		integral_err = {cn: 0.0 for cn in coord_names}   # reset to avoid windup fighting new goal
-		# Reset reservoir so old-goal context doesn't corrupt predictions for the
-		# new target.  The washout phase (ESN_TARGET_WASHOUT_STEPS steps of real
-		# arm data + new q_goal) then re-fills _esn_r with fresh context before
-		# we trust the readout again.
-		_esn_r[:] = 0.0
+		# ── Reservoir pre-warm: pause simulation, warm reservoir ─────────────
+		# Simulation physics are frozen for ESN_TARGET_WARMUP_STEPS ticks.
+		# Each tick the reservoir is stepped with the current arm state + new
+		# goal so activity smoothly transitions into the new context.
+		# Ghost pins to real arm; RLS is suppressed throughout.
+		_esn_horizon_buf.clear()        # stale K-step-old entries are now invalid
+		_esn_warmup_rem        = ESN_TARGET_WARMUP_STEPS
 		_esn_target_washout_rem = ESN_TARGET_WASHOUT_STEPS
+		print(f"  [ESN] warming up reservoir ({ESN_TARGET_WARMUP_STEPS} steps) — sim paused", flush=True)
 		new_dist = float(np.linalg.norm(ee_pos - target_pos_seg))
 		t_reach  = float(state.getTime())
 
