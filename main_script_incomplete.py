@@ -120,18 +120,17 @@ GROUND_MOBOD_IX = 0
 # ── ESN forward predictive model ──────────────────────────────────────────────
 # Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
 # Output          : predicted q_next[2] + qd_next[2]             =  4 features
-ESN_N_RESERVOIR   = 1_000         # reservoir nodes
+ESN_N_RESERVOIR   = 3_000         # reservoir nodes
 ESN_WASHOUT_STEPS = 100          # skip updates while reservoir settles
 # ── Online RLS (Recursive Least Squares) parameters ───────────────────────────
 # W_out is updated after EVERY step via the Sherman-Morrison rank-1 update on
 # P = (ΦᵀΦ)⁻¹, giving the exact optimal readout at all times with no batch solve.
-ESN_RLS_LAMBDA    = 0.999   # forgetting factor  (1 = no forgetting, <1 = exponential decay)
+ESN_RLS_LAMBDA    = 1   # forgetting factor  (1 = no forgetting, <1 = exponential decay)
 ESN_RLS_DELTA     = 1e4     # initial P = delta·I  (high → fast early learning)
 ESN_RLS_WARMUP    = 200     # show ghost at real arm for this many RLS steps before trusting W_out
 # Per-target washout: skip RLS updates for this many steps after a new target so
 # the high-velocity transition spike doesn't corrupt P.
 ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
-ESN_LEARN_STOP_REACHES    = 10    # freeze W_out / P after this many successful reaches
 # Threshold-gated learning: RLS update only fires when ||Δq|| exceeds this value.
 # Below the threshold the model runs pure inference (no weight change).
 # Maps to inferior-olive / climbing-fiber signal in the cerebellum.
@@ -340,7 +339,7 @@ def after_simulation_step(
 	    "qd"  – {coord_name: rad/s}
 	    "end_effector_pos_ground" – np.ndarray
 	"""
-	global _esn_frozen, _esn_conv_count, _esn_err_ema_q, _esn_P, _esn_rls_n, _esn_target_washout_rem, _esn_learning_stopped
+	global _esn_frozen, _esn_conv_count, _esn_err_ema_q, _esn_P, _esn_rls_n, _esn_target_washout_rem
 
 	# Skip everything during the initial washout (reservoir settling period).
 	if _esn_step_count <= ESN_WASHOUT_STEPS:
@@ -364,7 +363,7 @@ def after_simulation_step(
 	# cerebellum runs pure inference with no weight change.
 	if _esn_target_washout_rem > 0:
 		_esn_target_washout_rem -= 1   # suppress spike data near target transitions
-	elif not _esn_learning_stopped and q_err_mag > ESN_ERROR_LEARN_THRESH:
+	elif q_err_mag > ESN_ERROR_LEARN_THRESH:
 		phi  = _esn._augment(_esn_r_at_pred)          # (N_aug,)
 		Pp   = _esn_P @ phi                           # (N_aug,)
 		denom = ESN_RLS_LAMBDA + float(phi @ Pp)      # scalar
@@ -1116,7 +1115,6 @@ _esn_target_washout_rem: int = 0
 _N_aug    = 2 * ESN_N_RESERVOIR + 1
 _esn_P:   np.ndarray = ESN_RLS_DELTA * np.eye(_N_aug)  # high initial uncertainty
 _esn_rls_n: int          = 0
-_esn_learning_stopped: bool = False   # set True after ESN_LEARN_STOP_REACHES reaches
 
 # ── Dedicated FK state for ESN ghost arm ──────────────────────────────────────
 # We need a state separate from _ik_state so FK evaluation (predicted q → 3D)
@@ -1417,24 +1415,6 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 				_esn_err_fig.canvas.flush_events()
 			except Exception:
 				pass
-
-		# ── Freeze learning after ESN_LEARN_STOP_REACHES reaches ─────────────
-		if targets_completed >= ESN_LEARN_STOP_REACHES and not _esn_learning_stopped:
-			_esn_learning_stopped = True
-			print(
-				f"\n[ESN] ◼ LEARNING STOPPED after {targets_completed} reaches "
-				f"at t={t_reach:.2f}s — W_out frozen, pure inference from here\n",
-				flush=True,
-			)
-			if _MPLOT_OK:
-				try:
-					_esn_err_ax.axvline(t_reach, color="red", lw=2.0, ls="--",
-					                    label=f"Learning stopped (reach {targets_completed})")
-					_esn_err_ax.legend(loc="upper right", fontsize=7)
-					_esn_err_fig.canvas.draw_idle()
-					_esn_err_fig.canvas.flush_events()
-				except Exception:
-					pass
 
 		print(
 			f"  ✓ target {targets_completed} reached at t={t_reach:.2f}s "
