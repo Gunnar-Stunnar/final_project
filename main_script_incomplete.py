@@ -1,8 +1,25 @@
 import os
 import sys
 import time
+import threading
 import collections
+import numpy as np
 from echoState import EchoStateNetwork
+
+# ── Keyboard-driven wrist perturbation ────────────────────────────────────────
+# Press SPACE to apply a random sustained force to the wrist; release to remove.
+try:
+    from pynput import keyboard as _pynput_kb
+    _PYNPUT_OK = True
+except ImportError:
+    _PYNPUT_OK = False
+
+_perturb_active: bool      = False   # True while SPACE is held
+_perturb_force:  np.ndarray = np.zeros(3)  # current 3-D force vector (Ground frame, N)
+_perturb_lock = threading.Lock()
+
+PERTURBATION_FORCE_N  = 150.0  # magnitude (N) — applied AFTER PID clamp so it's always felt
+PERTURBATION_TAU_LIM  = 80.0   # separate hard cap on the perturbation torque (Nm)
 
 # Real-time error plot — import with a fallback so the sim still runs if Tk is absent.
 try:
@@ -1149,6 +1166,24 @@ def _esn_fk(q_pred: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 	)
 
 
+def _wrist_jacobian(q_dict: dict, delta: float = 1e-4) -> np.ndarray:
+	"""Numerical 3×n_coords Jacobian of wrist (hand) position w.r.t. joint angles.
+
+	Uses the ESN FK state with finite differences.  Returns J shape (3, n_coords)
+	so that  τ_perturb = Jᵀ · F_wrist  gives joint torques for a Cartesian force.
+	"""
+	q0 = np.array([q_dict.get(cn, 0.0) for cn in coord_names])
+	_, _, p0 = _esn_fk(q0)
+	J = np.zeros((3, len(coord_names)))
+	for i in range(len(coord_names)):
+		q_plus = q0.copy()
+		q_plus[i] += delta
+		_, _, p_plus = _esn_fk(q_plus)
+		J[:, i] = (p_plus - p0) / delta
+	_esn_fk(q0)   # restore FK state to original q
+	return J
+
+
 print(
 	f"[ESN] reservoir={ESN_N_RESERVOIR}  n_in={_ESN_N_IN}  n_out={_ESN_N_OUT}  "
 	f"RLS λ={ESN_RLS_LAMBDA}  δ={ESN_RLS_DELTA}  warmup={ESN_RLS_WARMUP}  "
@@ -1195,6 +1230,33 @@ wall_t0 = time.time()
 # Integral accumulator for PID gravity compensation (rad·s, reset on new target).
 integral_err: dict[str, float] = {cn: 0.0 for cn in coord_names}
 
+# ── Keyboard listener for wrist perturbation ──────────────────────────────────
+if _PYNPUT_OK:
+    def _on_press(key):
+        global _perturb_active, _perturb_force
+        if key == _pynput_kb.Key.space and not _perturb_active:
+            direction = np.random.randn(3)
+            direction /= np.linalg.norm(direction)
+            with _perturb_lock:
+                _perturb_force  = direction * PERTURBATION_FORCE_N
+                _perturb_active = True
+            print(f"[PERTURB] ON  F={_perturb_force.round(1)}", flush=True)
+
+    def _on_release(key):
+        global _perturb_active, _perturb_force
+        if key == _pynput_kb.Key.space:
+            with _perturb_lock:
+                _perturb_active = False
+                _perturb_force  = np.zeros(3)
+            print("[PERTURB] OFF", flush=True)
+
+    _kb_listener = _pynput_kb.Listener(on_press=_on_press, on_release=_on_release,
+                                        daemon=True)
+    _kb_listener.start()
+    print("[PERTURB] Keyboard listener active — hold SPACE to apply wrist force.", flush=True)
+else:
+    print("[PERTURB] pynput not available — keyboard perturbation disabled.", flush=True)
+
 print(
 	f"[Run] visualizer={'on' if USE_VISUALIZER else 'off'}  "
 	f"stepsize={stepsize}  max_sim_time={MAX_SIM_TIME_S}s  "
@@ -1235,10 +1297,30 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 		lim = float(TAU_LIMIT.get(cn, 1e9))
 		tau_cmd[cn] = float(np.clip(tau, -lim, lim))
 
-	# ── Write controls ────────────────────────────────────────────────────────
+	# ── Write PID controls ────────────────────────────────────────────────────
 	for cn in coord_names:
 		func = osim.Constant.safeDownCast(functionSet.get(actuator_index_for_coord[cn]))
 		func.setValue(tau_cmd[cn])
+
+	# ── Wrist perturbation (SPACE key) ────────────────────────────────────────
+	# Applied AFTER the PID clamp so it is never squeezed out by the PID budget.
+	# Jᵀ·F converts the random Cartesian wrist force into joint torques; the
+	# result is written directly on top of the PID value, capped only by
+	# PERTURBATION_TAU_LIM (not the shared TAU_LIMIT) so it's always felt.
+	with _perturb_lock:
+		_p_active = _perturb_active
+		_p_force  = _perturb_force.copy()
+	if _p_active:
+		try:
+			J = _wrist_jacobian(q_cur)                       # (3, n_coords)
+			tau_perturb = J.T @ _p_force                     # (n_coords,)
+			for i, cn in enumerate(coord_names):
+				total = tau_cmd[cn] + float(tau_perturb[i])
+				total = float(np.clip(total, -PERTURBATION_TAU_LIM, PERTURBATION_TAU_LIM))
+				func = osim.Constant.safeDownCast(functionSet.get(actuator_index_for_coord[cn]))
+				func.setValue(total)
+		except Exception:
+			pass
 
 	# ── User hook ─────────────────────────────────────────────────────────────
 	ee_pos = _get_end_effector_position_in_ground(model, state, ee_body)
