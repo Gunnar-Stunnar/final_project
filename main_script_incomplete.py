@@ -159,7 +159,7 @@ COORD_ACTUATOR_OPTIMAL_FORCE = {
 	"shoulder_elv": 1.0,
 	"elbow_flexion": 1.0,
 }
-MAX_SIM_TIME_S = 45.0
+MAX_SIM_TIME_S = float("inf")  # run forever — stop with Ctrl+C
 RNG_SEED = 1
 
 # Hard torque limits (Nm). Prevents numerical blow-up.
@@ -176,6 +176,19 @@ TAU_LIMIT = {
 # The cerebellum (ESN) steps every simulation tick and receives the held torque
 # as its efference copy — predicting forward at fine resolution between coarse commands.
 PID_UPDATE_INTERVAL_MS    = 50.0    # ms — how often PID issues a new torque command (tune: 10–200 ms)
+
+# ── Deep Cerebellar Nuclei (DCN) feedforward torque ───────────────────────────
+# τ_DCN = K_DCN · (q_goal − pc_output)
+#   pc_output  = ESN's predicted next joint position (Purkinje cell proxy)
+#   q_goal     = current reaching target
+#
+# When the cerebellum predicts the arm will reach the goal → τ_DCN ≈ 0.
+# When it predicts a shortfall → τ_DCN adds a corrective boost every tick.
+# τ_total = τ_PID + τ_DCN  (DCN contribution is capped by DCN_TAU_LIMIT).
+#
+# Set K_DCN = 0.0 to disable the cerebellar output entirely.
+K_DCN         = 15.0    # Nm/rad — cerebellum adds anticipatory torque every tick (0 = off)
+DCN_TAU_LIMIT = 50.0  # Nm    — hard cap on the DCN contribution per joint
 
 # If True and the visualizer is enabled, throttle the integration loop to real time
 # so the animation doesn't finish instantly (and doesn't look "stuck").
@@ -1015,8 +1028,8 @@ rng = np.random.default_rng(RNG_SEED)
 #   Ki eliminates that remaining offset so the arm actually arrives at the target.
 #
 #   Elbow I ≈ 0.5 kg·m²; at Kp=60: Kd_crit = 2·√30 ≈ 11 → Kd=14 (overdamped, smooth).
-Kp = {"shoulder_elv": 100.0, "elbow_flexion": 60.0}
-Kd = {"shoulder_elv": 28.0,  "elbow_flexion": 14.0}
+Kp = {"shoulder_elv": 160.0, "elbow_flexion": 90.0}   # stronger pull toward target
+Kd = {"shoulder_elv": 45.0,  "elbow_flexion": 22.0}   # critically damped — fast without oscillation
 Ki = {"shoulder_elv": 15.0,  "elbow_flexion": 8.0}   # integral: kills gravity offset
 # Anti-windup: clamp the accumulated integral (in rad·s) to this value.
 KI_MAX = {"shoulder_elv": 3.0, "elbow_flexion": 2.0}
@@ -1221,7 +1234,7 @@ if _MPLOT_OK:
 	_esn_err_ax.set_ylabel("Prediction error magnitude")
 	_esn_err_ax.set_title("ESN one-step-ahead error  (↓ = learning)  |  cyan ticks = RLS update fired")
 	_esn_err_ax.legend(loc="upper right", fontsize=7)
-	_esn_err_ax.set_xlim(0, MAX_SIM_TIME_S)
+	_esn_err_ax.set_xlim(0, 60)   # initial x-range; autoscales as time progresses
 	_esn_err_fig.tight_layout()
 	try:
 		_esn_err_fig.canvas.draw()
@@ -1271,7 +1284,7 @@ else:
 
 print(
 	f"[Run] visualizer={'on' if USE_VISUALIZER else 'off'}  "
-	f"stepsize={stepsize}  max_sim_time={MAX_SIM_TIME_S}s  "
+	f"stepsize={stepsize}  max_sim_time=∞ (Ctrl+C to stop)  "
 	f"Kp={Kp}  Kd={Kd}",
 	file=sys.stdout,
 )
@@ -1287,7 +1300,8 @@ functionSet = brain.get_ControlFunctions()
 # ── PID rate control ──────────────────────────────────────────────────────────
 _pid_update_steps = max(1, round(PID_UPDATE_INTERVAL_MS / (stepsize * 1000.0)))
 _pid_step_counter = 0                                # ticks since last PID update
-_held_tau_cmd     = {cn: 0.0 for cn in coord_names}  # last issued torque (efference copy)
+_held_tau_cmd     = {cn: 0.0 for cn in coord_names}  # last PID-issued torque
+_last_tau_total   = {cn: 0.0 for cn in coord_names}  # last full command (PID + DCN) — efference copy
 print(f"[PID] update every {_pid_update_steps} steps ({PID_UPDATE_INTERVAL_MS:.0f} ms)  "
       f"ESN efference copy = held torque between updates", flush=True)
 
@@ -1387,8 +1401,31 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	}
 	ghost_positions = on_simulation_step(
 		float(state.getTime()), state_snapshot,
-		{f"{cn}_torque": tau_cmd[cn] for cn in coord_names},
+		{f"{cn}_torque": _last_tau_total[cn] for cn in coord_names},  # full PID+DCN command
 	)
+
+	# ── DCN feedforward torque ────────────────────────────────────────────────
+	# τ_DCN = K_DCN · (q_goal − pc_output)   applied every tick (not rate-limited).
+	# pc_output = ESN's current predicted next joint position (denormalised → rad).
+	# τ_total = τ_PID_held + τ_DCN, written to actuators before integration.
+	_n_c = len(coord_names)
+	_pc_rad = _esn_last_pred[:_n_c] * _ESN_SCALE_Q   # denormalise → rad
+	for _i, _cn in enumerate(coord_names):
+		if K_DCN != 0.0:
+			_dcn_tau = float(np.clip(
+				K_DCN * (q_goal_seg[_cn] - float(_pc_rad[_i])),
+				-DCN_TAU_LIMIT, DCN_TAU_LIMIT,
+			))
+		else:
+			_dcn_tau = 0.0
+		_tau_total = float(np.clip(
+			tau_cmd[_cn] + _dcn_tau,
+			-float(TAU_LIMIT.get(_cn, 1e9)) - DCN_TAU_LIMIT,
+			 float(TAU_LIMIT.get(_cn, 1e9)) + DCN_TAU_LIMIT,
+		))
+		_last_tau_total[_cn] = _tau_total   # record full command as efference copy
+		_func = osim.Constant.safeDownCast(functionSet.get(actuator_index_for_coord[_cn]))
+		_func.setValue(_tau_total)
 
 	# ── Integrate one step ────────────────────────────────────────────────────
 	state = manager.integrate(t_next)
@@ -1402,7 +1439,7 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 		t_cur,
 		float(state.getTime()),
 		state_snapshot,
-		{f"{cn}_torque": tau_cmd[cn] for cn in coord_names},
+		{f"{cn}_torque": _last_tau_total[cn] for cn in coord_names},  # full PID+DCN
 		{
 			"q":                       q_now,
 			"qd":                      qd_now,
