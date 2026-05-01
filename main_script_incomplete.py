@@ -103,17 +103,32 @@ GROUND_MOBOD_IX = 0
 # ── ESN forward predictive model ──────────────────────────────────────────────
 # Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
 # Output          : predicted q_next[2] + qd_next[2]             =  4 features
-ESN_N_RESERVOIR   = 500          # reservoir nodes
-ESN_LEARNING_RATE = 5e-4         # delta-rule step size for online_update
-ESN_WASHOUT_STEPS = 100          # skip weight updates while reservoir settles
+ESN_N_RESERVOIR   = 1_000         # reservoir nodes
+ESN_WASHOUT_STEPS = 100          # skip updates while reservoir settles
+# ── Online RLS (Recursive Least Squares) parameters ───────────────────────────
+# W_out is updated after EVERY step via the Sherman-Morrison rank-1 update on
+# P = (ΦᵀΦ)⁻¹, giving the exact optimal readout at all times with no batch solve.
+ESN_RLS_LAMBDA    = 0.999   # forgetting factor  (1 = no forgetting, <1 = exponential decay)
+ESN_RLS_DELTA     = 1e4     # initial P = delta·I  (high → fast early learning)
+ESN_RLS_WARMUP    = 200     # show ghost at real arm for this many RLS steps before trusting W_out
+# Per-target washout: skip RLS updates for this many steps after a new target so
+# the high-velocity transition spike doesn't corrupt P.
+ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
+ESN_LEARN_STOP_REACHES    = 10    # freeze W_out / P after this many successful reaches
+# Threshold-gated learning: RLS update only fires when ||Δq|| exceeds this value.
+# Below the threshold the model runs pure inference (no weight change).
+# Maps to inferior-olive / climbing-fiber signal in the cerebellum.
+ESN_ERROR_LEARN_THRESH    = 0.05  # rad (~3°) — tune lower to learn more, higher for less
+# Plot update rate (green milestone lines are now replaced by convergence line only).
+ESN_PLOT_INTERVAL = 40            # redraw error plot every N steps
+# Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
+ESN_CONVERGENCE_Q_THRESH = 0.03   # rad (~1.7°)
+ESN_CONVERGENCE_WINDOW   = 400    # consecutive steps below threshold
+ESN_EMA_ALPHA_CONV       = 0.05   # EMA smoothing for convergence detection
 # Ghost arm colour when showing ESN predictions (blue).
 GHOST_COLOR = (0.15, 0.45, 1.0)
-# Exponential moving-average smoothing on ghost joint positions.
-# α=1 → no smoothing (raw prediction); α=0.2 → heavy smoothing.
-GHOST_EMA_ALPHA = 0.25
 # Maximum allowed deviation (rad) between predicted q and actual q.
-# Clamps wild FK inputs when ESN weights are still near-zero.
-GHOST_MAX_Q_DEV_RAD = 0.4
+# Clamps wild FK inputs when W_out is still near-zero early in training.
 # Keep targets in an "easier" region so the arm doesn't have to reach extreme high poses.
 # Bounds are in Ground coordinates (meters).
 TARGET_X_RANGE_M = (0.05, 0.26)
@@ -211,10 +226,6 @@ _step_log: list[dict] = []
 # ── Ghost lag buffer (kept for reference, ESN ghost replaces its use) ─────────
 _lag_buffer: collections.deque = collections.deque()
 
-# ── EMA state for ghost arm smoothing ─────────────────────────────────────────
-_ghost_ema: dict[str, np.ndarray | None] = {
-    "shoulder": None, "elbow": None, "hand": None,
-}
 
 
 def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) -> dict:
@@ -254,42 +265,31 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 	qdd    = state_snapshot.get("qdd", {cn: 0.0 for cn in coord_names})
 	q_goal = state_snapshot["q_goal"]
 	tau    = {cn: torque_commands.get(f"{cn}_torque", 0.0) for cn in coord_names}
+	n_coords = len(coord_names)
 
-	# ── Step ESN reservoir with current state + motor commands ────────────────
+	# ── Cerebellum forward model ──────────────────────────────────────────────
+	# Input: current real state (q, qd, qdd) + efference copy (tau) + goal.
+	# Output: one-step-ahead prediction of next (q, qd).
+	# The prediction is the ghost arm position — no coupling to the real arm
+	# except when W_out is re-solved (climbing-fiber correction, green lines).
 	u      = _build_esn_input_vec(q, qd, qdd, tau, q_goal)
 	_esn_r = _esn.step(_esn_r, u)
-
-	# Store reservoir state at prediction time for the after-step weight update.
 	_esn_r_at_pred = _esn_r.copy()
-
-	# One-step-ahead prediction: [q_shoulder_next, q_elbow_next, qd_shoulder_next, qd_elbow_next]
 	_esn_last_pred = _esn._readout(_esn_r).copy()
 	_esn_step_count += 1
 
-	# ── Forward kinematics: predicted q → Ground-frame 3D joint positions ────
-	# Clamp predicted joint angles to stay within GHOST_MAX_Q_DEV_RAD of the
-	# actual current q.  This prevents wild FK results when W_out is near-zero
-	# (early training) or immediately after a new target fires and q_goal jumps.
+	# ── Ghost arm FK ──────────────────────────────────────────────────────────
+	# Before the first W_out solve (buffer still filling) W_out ≈ 0 so pred ≈ 0.
+	# Show ghost at real arm until training has begun so the figure is sensible.
 	q_actual_arr = np.array([q.get(cn, 0.0) for cn in coord_names])
-	pred_q_arr   = np.clip(
-		_esn_last_pred[:len(coord_names)],
-		q_actual_arr - GHOST_MAX_Q_DEV_RAD,
-		q_actual_arr + GHOST_MAX_Q_DEV_RAD,
-	)
-	raw_shoulder, raw_elbow, raw_hand = _esn_fk(pred_q_arr)
+	if _esn_rls_n < ESN_RLS_WARMUP or _esn_target_washout_rem > 0:
+		# Not yet trained, OR reservoir is settling into new target context —
+		# pin ghost to real arm so there is no wild jump in the visualizer.
+		pred_q_arr = q_actual_arr
+	else:
+		pred_q_arr = _esn_last_pred[:n_coords]
 
-	# ── Exponential moving-average smoothing (prevents visual snapping) ───────
-	α = GHOST_EMA_ALPHA
-	def _ema(key: str, raw: np.ndarray) -> np.ndarray:
-		if _ghost_ema[key] is None:
-			_ghost_ema[key] = raw.copy()
-		else:
-			_ghost_ema[key] = α * raw + (1.0 - α) * _ghost_ema[key]
-		return _ghost_ema[key]
-
-	ghost_shoulder = _ema("shoulder", raw_shoulder)
-	ghost_elbow    = _ema("elbow",    raw_elbow)
-	ghost_hand     = _ema("hand",     raw_hand)
+	ghost_shoulder, ghost_elbow, ghost_hand = _esn_fk(pred_q_arr)
 
 	return {
 		"ghost_shoulder": ghost_shoulder,
@@ -323,8 +323,9 @@ def after_simulation_step(
 	    "qd"  – {coord_name: rad/s}
 	    "end_effector_pos_ground" – np.ndarray
 	"""
-	# Skip weight updates during the initial washout period while the reservoir
-	# is still settling from its zero initial state.
+	global _esn_frozen, _esn_conv_count, _esn_err_ema_q, _esn_P, _esn_rls_n, _esn_target_washout_rem, _esn_learning_stopped
+
+	# Skip everything during the initial washout (reservoir settling period).
 	if _esn_step_count <= ESN_WASHOUT_STEPS:
 		return
 
@@ -336,16 +337,69 @@ def after_simulation_step(
 	# Prediction error: positive → ESN undershot, negative → overshot.
 	error = actual - _esn_last_pred                  # shape (4,)
 
-	# Delta rule: W_out += lr · error ⊗ φ(r_at_pred)
-	_esn.online_update(_esn_r_at_pred, error, learning_rate=ESN_LEARNING_RATE)
+	n          = len(coord_names)
+	q_err_mag  = float(np.linalg.norm(error[:n]))                      # ||Δq||  (rad)
+	qd_err_mag = float(np.linalg.norm(error[n:]) / _ESN_QD_SCALE)     # ||Δqd|| (rad/s, unscaled for display)
+
+	# ── Threshold-gated RLS update (climbing-fiber model) ────────────────────
+	# Mirrors the inferior olive → climbing fiber pathway: the update only fires
+	# when the prediction error exceeds ESN_ERROR_LEARN_THRESH.  Below that the
+	# cerebellum runs pure inference with no weight change.
+	if _esn_target_washout_rem > 0:
+		_esn_target_washout_rem -= 1   # suppress spike data near target transitions
+	elif not _esn_learning_stopped and q_err_mag > ESN_ERROR_LEARN_THRESH:
+		phi  = _esn._augment(_esn_r_at_pred)          # (N_aug,)
+		Pp   = _esn_P @ phi                           # (N_aug,)
+		denom = ESN_RLS_LAMBDA + float(phi @ Pp)      # scalar
+		gain  = Pp / denom                            # (N_aug,)
+		_esn.W_out += np.outer(error, gain)           # (n_out, N_aug) rank-1 correction
+		_esn_P = (_esn_P - np.outer(gain, Pp)) / ESN_RLS_LAMBDA
+		_esn_rls_n += 1
+		# Mark this learning event on the error plot (climbing-fiber tick).
+		if _MPLOT_OK:
+			try:
+				_esn_err_ax.axvline(t_now, color="cyan", lw=0.5, alpha=0.25)
+				_esn_err_fig.canvas.draw_idle()
+			except Exception:
+				pass
+
+	# ── Convergence milestone (diagnostic only — does NOT stop learning) ───────
+	# When EMA‖Δq‖ stays below the threshold long enough, mark the milestone on
+	# the plot.  RLS continues updating W_out every step regardless.
+	_esn_err_ema_q = (ESN_EMA_ALPHA_CONV * q_err_mag
+	                  + (1.0 - ESN_EMA_ALPHA_CONV) * _esn_err_ema_q)
+
+	if not _esn_frozen:                        # _esn_frozen now means "milestone printed"
+		if _esn_err_ema_q < ESN_CONVERGENCE_Q_THRESH:
+			_esn_conv_count += 1
+			if _esn_conv_count >= ESN_CONVERGENCE_WINDOW:
+				_esn_frozen = True             # just marks that the milestone fired once
+				print(
+					f"\n[ESN] ★ CONVERGED at t={t_now:.2f}s  "
+					f"EMA‖Δq‖={_esn_err_ema_q:.4f} rad  "
+					f"(continual learning continues — W_out still updating)\n",
+					flush=True,
+				)
+				if _MPLOT_OK:
+					try:
+						_esn_err_ax.axvline(
+							t_now, color="lime", ls="--", lw=1.5,
+							label=f"Converged t={t_now:.1f}s",
+						)
+						_esn_err_ax.legend(loc="upper right")
+						_esn_err_fig.canvas.draw_idle()
+						_esn_err_fig.canvas.flush_events()
+					except Exception:
+						pass
+		else:
+			_esn_conv_count = 0   # error spiked — reset counter, keep learning
 
 	# ── Real-time error plot ──────────────────────────────────────────────────
-	n = len(coord_names)
 	_esn_err_t.append(t_now)
-	_esn_err_q.append(float(np.linalg.norm(error[:n])))    # ||Δq||  (rad)
-	_esn_err_qd.append(float(np.linalg.norm(error[n:])))   # ||Δqd|| (rad/s)
+	_esn_err_q.append(q_err_mag)
+	_esn_err_qd.append(qd_err_mag)
 
-	if _MPLOT_OK and _esn_step_count % 40 == 0:
+	if _MPLOT_OK and _esn_step_count % ESN_PLOT_INTERVAL == 0:
 		_esn_line_q.set_xdata(_esn_err_t)
 		_esn_line_q.set_ydata(_esn_err_q)
 		_esn_line_qd.set_xdata(_esn_err_t)
@@ -990,13 +1044,20 @@ def _build_esn_input_vec(
 	)
 
 
+_ESN_QD_SCALE = stepsize          # convert rad/s → rad/step  (≈ 0.005)
+_ESN_QD_CLIP  = 5.0 * _ESN_QD_SCALE  # clip target qd to ±5 steps-worth of motion
+
 def _build_esn_target_vec(q: dict, qd: dict) -> np.ndarray:
-	"""Flatten actual (q_next, qd_next) → length-4 ESN target."""
-	return np.array(
-		[q.get(cn, 0.0)  for cn in coord_names] +
-		[qd.get(cn, 0.0) for cn in coord_names],
-		dtype=float,
-	)
+	"""Flatten actual (q_next, qd_next) → length-4 ESN target.
+
+	Velocity is scaled by dt (rad/s → rad/step) so that q and qd live
+	on the same numerical scale.  Scaled qd is also clipped to suppress
+	spike corruption of the replay buffer at target transitions.
+	"""
+	q_arr  = np.array([q.get(cn, 0.0)  for cn in coord_names], dtype=float)
+	qd_arr = np.array([qd.get(cn, 0.0) for cn in coord_names], dtype=float)
+	qd_scaled = np.clip(qd_arr * _ESN_QD_SCALE, -_ESN_QD_CLIP, _ESN_QD_CLIP)
+	return np.concatenate([q_arr, qd_scaled])
 
 
 # ── ESN instance ──────────────────────────────────────────────────────────────
@@ -1023,6 +1084,22 @@ _esn_r:          np.ndarray = np.zeros(ESN_N_RESERVOIR)  # current reservoir sta
 _esn_r_at_pred:  np.ndarray = np.zeros(ESN_N_RESERVOIR)  # state at last prediction
 _esn_last_pred:  np.ndarray = np.zeros(_ESN_N_OUT)        # last prediction vector
 _esn_step_count: int        = 0                            # steps elapsed
+# Convergence tracking
+_esn_frozen:     bool  = False
+_esn_conv_count: int   = 0
+_esn_err_ema_q:  float = 1.0
+# Per-target washout counter: counts down from ESN_TARGET_WASHOUT_STEPS after each
+# new target.  RLS updates are suppressed while this is > 0.
+_esn_target_washout_rem: int = 0
+
+# ── Online RLS state ──────────────────────────────────────────────────────────
+# P  : running estimate of (ΦᵀΦ)⁻¹, shape (N_aug, N_aug).
+#      Updated every step via Sherman-Morrison rank-1 formula — O(N²) per step.
+# _esn_rls_n : number of RLS updates performed (used for warmup gating).
+_N_aug    = 2 * ESN_N_RESERVOIR + 1
+_esn_P:   np.ndarray = ESN_RLS_DELTA * np.eye(_N_aug)  # high initial uncertainty
+_esn_rls_n: int          = 0
+_esn_learning_stopped: bool = False   # set True after ESN_LEARN_STOP_REACHES reaches
 
 # ── Dedicated FK state for ESN ghost arm ──────────────────────────────────────
 # We need a state separate from _ik_state so FK evaluation (predicted q → 3D)
@@ -1074,7 +1151,8 @@ def _esn_fk(q_pred: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 print(
 	f"[ESN] reservoir={ESN_N_RESERVOIR}  n_in={_ESN_N_IN}  n_out={_ESN_N_OUT}  "
-	f"lr={ESN_LEARNING_RATE}  washout={ESN_WASHOUT_STEPS} steps",
+	f"RLS λ={ESN_RLS_LAMBDA}  δ={ESN_RLS_DELTA}  warmup={ESN_RLS_WARMUP}  "
+	f"washout={ESN_WASHOUT_STEPS} steps",
 	flush=True,
 )
 
@@ -1089,10 +1167,13 @@ if _MPLOT_OK:
 	_esn_err_fig.canvas.manager.set_window_title("ESN Online Learning — Prediction Error")
 	_esn_line_q,  = _esn_err_ax.plot([], [], lw=1.2, color="royalblue",  label="||Δq||  (rad)")
 	_esn_line_qd, = _esn_err_ax.plot([], [], lw=1.2, color="darkorange", label="||Δqd|| (rad/s)", alpha=0.7)
+	# Horizontal line showing the learning threshold — RLS fires only above this.
+	_esn_err_ax.axhline(ESN_ERROR_LEARN_THRESH, color="cyan", lw=1.0, ls=":",
+	                    alpha=0.7, label=f"Learn thresh ({ESN_ERROR_LEARN_THRESH} rad)")
 	_esn_err_ax.set_xlabel("Simulation time (s)")
 	_esn_err_ax.set_ylabel("Prediction error magnitude")
-	_esn_err_ax.set_title("ESN one-step-ahead error  (↓ = learning)")
-	_esn_err_ax.legend(loc="upper right")
+	_esn_err_ax.set_title("ESN one-step-ahead error  (↓ = learning)  |  cyan ticks = RLS update fired")
+	_esn_err_ax.legend(loc="upper right", fontsize=7)
 	_esn_err_ax.set_xlim(0, MAX_SIM_TIME_S)
 	_esn_err_fig.tight_layout()
 	try:
@@ -1236,9 +1317,45 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 			_ik_coords.get(_cn).setValue(_ik_state, q_goal_seg[_cn])
 		move_t0 = float(state.getTime())
 		integral_err = {cn: 0.0 for cn in coord_names}   # reset to avoid windup fighting new goal
+		# Reset reservoir so old-goal context doesn't corrupt predictions for the
+		# new target.  The washout phase (ESN_TARGET_WASHOUT_STEPS steps of real
+		# arm data + new q_goal) then re-fills _esn_r with fresh context before
+		# we trust the readout again.
+		_esn_r[:] = 0.0
+		_esn_target_washout_rem = ESN_TARGET_WASHOUT_STEPS
 		new_dist = float(np.linalg.norm(ee_pos - target_pos_seg))
+		t_reach  = float(state.getTime())
+
+		# ── Mark reach on error plot ──────────────────────────────────────────
+		if _MPLOT_OK:
+			try:
+				_esn_err_ax.axvline(t_reach, color="orange", lw=0.8, alpha=0.6,
+				                    label=f"reach" if targets_completed == 1 else None)
+				_esn_err_fig.canvas.draw_idle()
+				_esn_err_fig.canvas.flush_events()
+			except Exception:
+				pass
+
+		# ── Freeze learning after ESN_LEARN_STOP_REACHES reaches ─────────────
+		if targets_completed >= ESN_LEARN_STOP_REACHES and not _esn_learning_stopped:
+			_esn_learning_stopped = True
+			print(
+				f"\n[ESN] ◼ LEARNING STOPPED after {targets_completed} reaches "
+				f"at t={t_reach:.2f}s — W_out frozen, pure inference from here\n",
+				flush=True,
+			)
+			if _MPLOT_OK:
+				try:
+					_esn_err_ax.axvline(t_reach, color="red", lw=2.0, ls="--",
+					                    label=f"Learning stopped (reach {targets_completed})")
+					_esn_err_ax.legend(loc="upper right", fontsize=7)
+					_esn_err_fig.canvas.draw_idle()
+					_esn_err_fig.canvas.flush_events()
+				except Exception:
+					pass
+
 		print(
-			f"  ✓ target {targets_completed} reached at t={state.getTime():.2f}s "
+			f"  ✓ target {targets_completed} reached at t={t_reach:.2f}s "
 			f"(dist={dist:.3f}m to old ball)  "
 			f"→ NEW target ({target_pos_seg[0]:.2f},{target_pos_seg[1]:.2f},{target_pos_seg[2]:.2f})  "
 			f"q_goal={{{', '.join(f'{k}: {v:.3f}' for k,v in q_goal_seg.items())}}}  "
