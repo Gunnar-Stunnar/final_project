@@ -170,6 +170,13 @@ TAU_LIMIT = {
 	"elbow_flexion": 30.0,
 }
 
+# ── Motor command update rate ─────────────────────────────────────────────────
+# The PID re-issues a new torque command only every PID_UPDATE_INTERVAL_MS.
+# Between updates the torque is held constant (zero-order hold).
+# The cerebellum (ESN) steps every simulation tick and receives the held torque
+# as its efference copy — predicting forward at fine resolution between coarse commands.
+PID_UPDATE_INTERVAL_MS    = 50.0    # ms — how often PID issues a new torque command (tune: 10–200 ms)
+
 # If True and the visualizer is enabled, throttle the integration loop to real time
 # so the animation doesn't finish instantly (and doesn't look "stuck").
 REALTIME_WHEN_VISUALIZING = True
@@ -303,7 +310,7 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 		# pin ghost to real arm so there is no wild jump in the visualizer.
 		pred_q_arr = q_actual_arr
 	else:
-		pred_q_arr = _esn_last_pred[:n_coords]
+		pred_q_arr = _esn_last_pred[:n_coords] * _ESN_SCALE_Q   # denormalise → rad
 
 	ghost_shoulder, ghost_elbow, ghost_hand = _esn_fk(pred_q_arr)
 
@@ -354,8 +361,8 @@ def after_simulation_step(
 	error = actual - _esn_last_pred                  # shape (4,)
 
 	n          = len(coord_names)
-	q_err_mag  = float(np.linalg.norm(error[:n]))                      # ||Δq||  (rad)
-	qd_err_mag = float(np.linalg.norm(error[n:]) / _ESN_QD_SCALE)     # ||Δqd|| (rad/s, unscaled for display)
+	q_err_mag  = float(np.linalg.norm(error[:n])) * _ESN_SCALE_Q       # ||Δq||  (rad)
+	qd_err_mag = float(np.linalg.norm(error[n:])) * _ESN_SCALE_QD     # ||Δqd|| (rad/s)
 
 	# ── Threshold-gated RLS update (climbing-fiber model) ────────────────────
 	# Mirrors the inferior olive → climbing fiber pathway: the update only fires
@@ -1046,34 +1053,41 @@ print(
 # ── ESN input / target vector helpers ────────────────────────────────────────
 # These reference coord_names (defined above) at call time — no forward-ref issue.
 
+# ── ESN input normalisation scales ────────────────────────────────────────────
+# All signals are divided by these values before entering the reservoir so every
+# channel lives roughly in [-1, 1].  Keeps the reservoir from being dominated by
+# large-magnitude signals (qdd, tau) and prevents ghost arm instability.
+_ESN_SCALE_Q    = np.pi          # joint angles  (rad)        max ≈ π
+_ESN_SCALE_QD   = 15.0           # joint velocity (rad/s)     typical peak ≈ 10
+_ESN_SCALE_QDD  = 200.0          # joint accel    (rad/s²)    typical peak ≈ 100–200
+_ESN_SCALE_TAU  = max(TAU_LIMIT.values()) if TAU_LIMIT else 60.0  # Nm
+_ESN_SCALE_QERR = np.pi          # goal error     (rad)
+
+
 def _build_esn_input_vec(
 	q: dict, qd: dict, qdd: dict, tau: dict, q_goal: dict,
 ) -> np.ndarray:
-	"""Flatten (q, qd, qdd, tau, q_goal) for each coord → length-10 ESN input."""
+	"""Normalised (q, qd, qdd, tau, q_goal) → length-10 ESN input in [-1, 1]."""
 	return np.array(
-		[q.get(cn, 0.0)      for cn in coord_names] +
-		[qd.get(cn, 0.0)     for cn in coord_names] +
-		[qdd.get(cn, 0.0)    for cn in coord_names] +
-		[tau.get(cn, 0.0)    for cn in coord_names] +
-		[q_goal.get(cn, 0.0) for cn in coord_names],
+		[q.get(cn, 0.0)      / _ESN_SCALE_Q    for cn in coord_names] +
+		[qd.get(cn, 0.0)     / _ESN_SCALE_QD   for cn in coord_names] +
+		[qdd.get(cn, 0.0)    / _ESN_SCALE_QDD  for cn in coord_names] +
+		[tau.get(cn, 0.0)    / _ESN_SCALE_TAU  for cn in coord_names] +
+		[q_goal.get(cn, 0.0) / _ESN_SCALE_Q    for cn in coord_names],
 		dtype=float,
 	)
 
 
-_ESN_QD_SCALE = stepsize          # convert rad/s → rad/step  (≈ 0.005)
-_ESN_QD_CLIP  = 5.0 * _ESN_QD_SCALE  # clip target qd to ±5 steps-worth of motion
 
 def _build_esn_target_vec(q: dict, qd: dict) -> np.ndarray:
-	"""Flatten actual (q_next, qd_next) → length-4 ESN target.
+	"""Normalised (q_next, qd_next) → length-4 ESN target in [-1, 1].
 
-	Velocity is scaled by dt (rad/s → rad/step) so that q and qd live
-	on the same numerical scale.  Scaled qd is also clipped to suppress
-	spike corruption of the replay buffer at target transitions.
+	Uses the same scales as _build_esn_input_vec so the readout W_out maps
+	reservoir activations (tanh, [-1,1]) to normalised output space.
 	"""
-	q_arr  = np.array([q.get(cn, 0.0)  for cn in coord_names], dtype=float)
-	qd_arr = np.array([qd.get(cn, 0.0) for cn in coord_names], dtype=float)
-	qd_scaled = np.clip(qd_arr * _ESN_QD_SCALE, -_ESN_QD_CLIP, _ESN_QD_CLIP)
-	return np.concatenate([q_arr, qd_scaled])
+	q_arr  = np.array([q.get(cn, 0.0)  / _ESN_SCALE_Q  for cn in coord_names], dtype=float)
+	qd_arr = np.array([qd.get(cn, 0.0) / _ESN_SCALE_QD for cn in coord_names], dtype=float)
+	return np.concatenate([q_arr, qd_arr])
 
 
 # ── ESN instance ──────────────────────────────────────────────────────────────
@@ -1270,6 +1284,13 @@ print(
 brain = osim.PrescribedController.safeDownCast(model.getControllerSet().get(0))
 functionSet = brain.get_ControlFunctions()
 
+# ── PID rate control ──────────────────────────────────────────────────────────
+_pid_update_steps = max(1, round(PID_UPDATE_INTERVAL_MS / (stepsize * 1000.0)))
+_pid_step_counter = 0                                # ticks since last PID update
+_held_tau_cmd     = {cn: 0.0 for cn in coord_names}  # last issued torque (efference copy)
+print(f"[PID] update every {_pid_update_steps} steps ({PID_UPDATE_INTERVAL_MS:.0f} ms)  "
+      f"ESN efference copy = held torque between updates", flush=True)
+
 while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	t_cur  = float(state.getTime())          # time at start of this step (= t_prev for the after-hook)
 	t_next = t_cur + stepsize
@@ -1278,11 +1299,12 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	q_cur  = {cn: coords.get(cn).getValue(state)      for cn in coord_names}
 	qd_cur = {cn: coords.get(cn).getSpeedValue(state) for cn in coord_names}
 
-	# ── PID controller ────────────────────────────────────────────────────────
-	# τ = Kp·(q_goal−q) + Ki·∫(q_goal−q)dt − Kd·q̇
-	# The integral term accumulates the gravity-induced steady-state offset so
-	# the arm actually arrives at the Cartesian target rather than settling short.
-	tau_cmd: dict[str, float] = {}
+	# ── PID controller (rate-limited output) ──────────────────────────────────
+	# Integral and state error accumulate every tick (keeps accuracy).
+	# A new torque command is only ISSUED every _pid_update_steps ticks.
+	# Between issues the last torque is held — zero-order hold on the output.
+	# The cerebellum receives this held torque as its efference copy each tick.
+	_new_tau: dict[str, float] = {}
 	for cn in coord_names:
 		pos_err = float(q_goal_seg[cn] - q_cur[cn])
 		integral_err[cn] = float(np.clip(
@@ -1293,12 +1315,18 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 			   + Ki[cn] * integral_err[cn]
 			   - Kd[cn] * float(qd_cur[cn]))
 		lim = float(TAU_LIMIT.get(cn, 1e9))
-		tau_cmd[cn] = float(np.clip(tau, -lim, lim))
+		_new_tau[cn] = float(np.clip(tau, -lim, lim))
 
-	# ── Write PID controls ────────────────────────────────────────────────────
-	for cn in coord_names:
-		func = osim.Constant.safeDownCast(functionSet.get(actuator_index_for_coord[cn]))
-		func.setValue(tau_cmd[cn])
+	_pid_step_counter += 1
+	if _pid_step_counter >= _pid_update_steps:
+		_pid_step_counter = 0
+		_held_tau_cmd = _new_tau   # latch new command
+		for cn in coord_names:
+			func = osim.Constant.safeDownCast(functionSet.get(actuator_index_for_coord[cn]))
+			func.setValue(_held_tau_cmd[cn])
+
+	# Expose held torque as tau_cmd so the rest of the loop is unchanged.
+	tau_cmd = _held_tau_cmd
 
 	# ── Wrist perturbation (SPACE key) ────────────────────────────────────────
 	# Applied AFTER the PID clamp so it is never squeezed out by the PID budget.
