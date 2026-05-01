@@ -120,12 +120,12 @@ GROUND_MOBOD_IX = 0
 # ── ESN forward predictive model ──────────────────────────────────────────────
 # Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
 # Output          : predicted q_next[2] + qd_next[2]             =  4 features
-ESN_N_RESERVOIR   = 3_000         # reservoir nodes
-ESN_WASHOUT_STEPS = 100          # skip updates while reservoir settles
+ESN_N_RESERVOIR   = 1500         # reservoir nodes
+ESN_WASHOUT_STEPS = 0          # skip updates while reservoir settles
 # ── Online RLS (Recursive Least Squares) parameters ───────────────────────────
 # W_out is updated after EVERY step via the Sherman-Morrison rank-1 update on
 # P = (ΦᵀΦ)⁻¹, giving the exact optimal readout at all times with no batch solve.
-ESN_RLS_LAMBDA    = 1   # forgetting factor  (1 = no forgetting, <1 = exponential decay)
+ESN_RLS_LAMBDA    = 0.999   # forgetting factor  (1 = no forgetting, <1 = exponential decay)
 ESN_RLS_DELTA     = 1e4     # initial P = delta·I  (high → fast early learning)
 ESN_RLS_WARMUP    = 200     # show ghost at real arm for this many RLS steps before trusting W_out
 # Per-target washout: skip RLS updates for this many steps after a new target so
@@ -136,7 +136,7 @@ ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
 # Maps to inferior-olive / climbing-fiber signal in the cerebellum.
 ESN_ERROR_LEARN_THRESH    = 0.05  # rad (~3°) — tune lower to learn more, higher for less
 # Plot update rate (green milestone lines are now replaced by convergence line only).
-ESN_PLOT_INTERVAL = 40            # redraw error plot every N steps
+ESN_PLOT_INTERVAL = 1             # redraw error plot every N steps
 # Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
 ESN_CONVERGENCE_Q_THRESH = 0.03   # rad (~1.7°)
 ESN_CONVERGENCE_WINDOW   = 400    # consecutive steps below threshold
@@ -187,8 +187,8 @@ PID_UPDATE_INTERVAL_MS    = 50.0    # ms — how often PID issues a new torque c
 # τ_total = τ_PID + τ_DCN  (DCN contribution is capped by DCN_TAU_LIMIT).
 #
 # Set K_DCN = 0.0 to disable the cerebellar output entirely.
-K_DCN         = 15.0    # Nm/rad — cerebellum adds anticipatory torque every tick (0 = off)
-DCN_TAU_LIMIT = 50.0  # Nm    — hard cap on the DCN contribution per joint
+K_DCN         = 10.0    # Nm/rad — cerebellum adds anticipatory torque every tick (0 = off)
+DCN_TAU_LIMIT = 75.0  # Nm    — hard cap on the DCN contribution per joint
 
 # If True and the visualizer is enabled, throttle the integration loop to real time
 # so the animation doesn't finish instantly (and doesn't look "stuck").
@@ -442,6 +442,12 @@ def after_simulation_step(
 		_esn_line_qd.set_ydata(_esn_err_qd)
 		_esn_err_ax.relim()
 		_esn_err_ax.autoscale_view(scalex=True, scaley=True)
+		# Update reservoir heatmap with current state snapshot.
+		if _im_heat is not None:
+			try:
+				_im_heat.set_data(_esn_r_at_pred.reshape(_HEAT_ROWS, _HEAT_COLS))
+			except Exception:
+				pass
 		try:
 			_esn_err_fig.canvas.draw_idle()
 			_esn_err_fig.canvas.flush_events()
@@ -1022,15 +1028,16 @@ rng = np.random.default_rng(RNG_SEED)
 #
 # Why these values:
 #   From the observed 2s oscillation, effective shoulder inertia I ≈ 3 kg·m².
+# ── PID gains ────────────────────────────────────────────────────────────────
 #   Critical damping requires Kd_crit = 2·√(Kp·I).
-#   → At Kp=100: Kd_crit = 2·√300 ≈ 34.6  → Kd=28 gives ζ ≈ 0.81 (well-damped).
-#   Gravity torque ≈ 10 Nm → steady-state PD error ≈ 10/100 = 0.1 rad → ~4 cm Cartesian.
+#   → At Kp=160: Kd_crit = 2·√(160·1.5) ≈ 30.9  → Kd=45 gives ζ > 1 (overdamped).
+#   Gravity torque ≈ 10 Nm → steady-state PD error ≈ 10/160 ≈ 0.06 rad.
 #   Ki eliminates that remaining offset so the arm actually arrives at the target.
 #
-#   Elbow I ≈ 0.5 kg·m²; at Kp=60: Kd_crit = 2·√30 ≈ 11 → Kd=14 (overdamped, smooth).
-Kp = {"shoulder_elv": 160.0, "elbow_flexion": 90.0}   # stronger pull toward target
-Kd = {"shoulder_elv": 45.0,  "elbow_flexion": 22.0}   # critically damped — fast without oscillation
-Ki = {"shoulder_elv": 15.0,  "elbow_flexion": 8.0}   # integral: kills gravity offset
+#   Elbow I ≈ 0.4 kg·m²; at Kp=90: Kd_crit = 2·√36 = 12 → Kd=22 (overdamped, smooth).
+Kp = {"shoulder_elv": 160.0, "elbow_flexion": 90.0}
+Kd = {"shoulder_elv": 45.0,  "elbow_flexion": 22.0}
+Ki = {"shoulder_elv": 15.0,  "elbow_flexion": 8.0}
 # Anti-windup: clamp the accumulated integral (in rad·s) to this value.
 KI_MAX = {"shoulder_elv": 3.0, "elbow_flexion": 2.0}
 
@@ -1223,29 +1230,50 @@ _esn_err_qd:  list[float] = []
 
 if _MPLOT_OK:
 	plt.ion()
-	_esn_err_fig, _esn_err_ax = plt.subplots(figsize=(9, 4))
-	_esn_err_fig.canvas.manager.set_window_title("ESN Online Learning — Prediction Error")
+	# Two-row layout: error plot (top) + reservoir heatmap (bottom).
+	_esn_err_fig = plt.figure(figsize=(11, 6))
+	_esn_err_fig.canvas.manager.set_window_title("ESN Online Learning")
+	_gs = _esn_err_fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.45)
+
+	# ── Top: prediction error over time ──────────────────────────────────────
+	_esn_err_ax = _esn_err_fig.add_subplot(_gs[0])
 	_esn_line_q,  = _esn_err_ax.plot([], [], lw=1.2, color="royalblue",  label="||Δq||  (rad)")
 	_esn_line_qd, = _esn_err_ax.plot([], [], lw=1.2, color="darkorange", label="||Δqd|| (rad/s)", alpha=0.7)
-	# Horizontal line showing the learning threshold — RLS fires only above this.
 	_esn_err_ax.axhline(ESN_ERROR_LEARN_THRESH, color="cyan", lw=1.0, ls=":",
 	                    alpha=0.7, label=f"Learn thresh ({ESN_ERROR_LEARN_THRESH} rad)")
 	_esn_err_ax.set_xlabel("Simulation time (s)")
 	_esn_err_ax.set_ylabel("Prediction error magnitude")
 	_esn_err_ax.set_title("ESN one-step-ahead error  (↓ = learning)  |  cyan ticks = RLS update fired")
 	_esn_err_ax.legend(loc="upper right", fontsize=7)
-	_esn_err_ax.set_xlim(0, 60)   # initial x-range; autoscales as time progresses
-	_esn_err_fig.tight_layout()
+	_esn_err_ax.set_xlim(0, 60)
+
+	# ── Bottom: reservoir state snapshot (heatmap) ────────────────────────────
+	# 1500 neurons reshaped to 30×50 for display.
+	_HEAT_ROWS, _HEAT_COLS = 30, 50   # must multiply to ESN_N_RESERVOIR
+	_ax_heat = _esn_err_fig.add_subplot(_gs[1])
+	_im_heat = _ax_heat.imshow(
+		np.zeros((_HEAT_ROWS, _HEAT_COLS)),
+		aspect="auto", cmap="RdBu_r", vmin=-1.0, vmax=1.0,
+		interpolation="nearest",
+	)
+	_esn_err_fig.colorbar(_im_heat, ax=_ax_heat, orientation="vertical",
+	                       fraction=0.015, pad=0.02)
+	_ax_heat.set_title("Reservoir state snapshot", fontsize=8)
+	_ax_heat.set_xlabel("Neuron (column)", fontsize=7)
+	_ax_heat.set_ylabel("Row", fontsize=7)
+	_ax_heat.tick_params(labelsize=6)
+
 	try:
 		_esn_err_fig.canvas.draw()
 		_esn_err_fig.canvas.flush_events()
 	except Exception:
 		pass
-	print("[ESN] Matplotlib error window opened.", flush=True)
+	print("[ESN] Matplotlib window opened (error + reservoir heatmap).", flush=True)
 else:
 	# Placeholders so after_simulation_step references don't raise NameError.
 	_esn_err_fig = _esn_err_ax = _esn_line_q = _esn_line_qd = None
-	print("[ESN] Matplotlib unavailable — error plot disabled.", flush=True)
+	_ax_heat = _im_heat = None
+	print("[ESN] Matplotlib unavailable — plot disabled.", flush=True)
 
 targets_completed = 0
 dist = float("inf")
@@ -1418,7 +1446,7 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 			))
 		else:
 			_dcn_tau = 0.0
-		_tau_total = float(np.clip(
+		_tau_total = float(np.clip(#_dcn_tau,
 			tau_cmd[_cn] + _dcn_tau,
 			-float(TAU_LIMIT.get(_cn, 1e9)) - DCN_TAU_LIMIT,
 			 float(TAU_LIMIT.get(_cn, 1e9)) + DCN_TAU_LIMIT,
