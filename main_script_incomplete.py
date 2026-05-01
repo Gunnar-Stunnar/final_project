@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import threading
+import queue
 import collections
 import numpy as np
 from echoState import EchoStateNetwork
@@ -14,9 +15,12 @@ try:
 except ImportError:
     _PYNPUT_OK = False
 
-_perturb_active: bool      = False   # True while SPACE is held
+_perturb_active: bool       = False   # True while SPACE is held
 _perturb_force:  np.ndarray = np.zeros(3)  # current 3-D force vector (Ground frame, N)
 _perturb_lock = threading.Lock()
+# Thread-safe queue for plot annotations requested by the keyboard thread.
+# Each entry is a dict: {"color", "ls", "lw", "alpha", "label"}
+_plot_event_queue: queue.SimpleQueue = queue.SimpleQueue()
 
 PERTURBATION_FORCE_N  = 150.0  # magnitude (N) — applied AFTER PID clamp so it's always felt
 PERTURBATION_TAU_LIM  = 80.0   # separate hard cap on the perturbation torque (Nm)
@@ -131,7 +135,7 @@ ESN_RLS_WARMUP    = 200     # show ghost at real arm for this many RLS steps bef
 # Per-target washout: skip RLS updates for this many steps after a new target so
 # the high-velocity transition spike doesn't corrupt P.
 ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
-ESN_LEARN_STOP_REACHES    = 10    # freeze W_out / P after this many successful reaches
+ESN_LEARN_STOP_REACHES    = 1    # freeze W_out / P after this many successful reaches
 # Threshold-gated learning: RLS update only fires when ||Δq|| exceeds this value.
 # Below the threshold the model runs pure inference (no weight change).
 # Maps to inferior-olive / climbing-fiber signal in the cerebellum.
@@ -275,7 +279,7 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 	    "ghost_shoulder", "ghost_elbow", "ghost_hand"  – np.ndarray[3] positions
 	    that drive the blue ESN-predicted ghost stick figure.
 	"""
-	global _esn_r, _esn_r_at_pred, _esn_last_pred, _esn_step_count
+	global _esn_r, _esn_r_at_pred, _esn_last_pred, _esn_step_count, _last_ghost_hand
 
 	q      = state_snapshot["q"]
 	qd     = state_snapshot["qd"]
@@ -307,6 +311,7 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 		pred_q_arr = _esn_last_pred[:n_coords]
 
 	ghost_shoulder, ghost_elbow, ghost_hand = _esn_fk(pred_q_arr)
+	_last_ghost_hand = ghost_hand.copy()
 
 	return {
 		"ghost_shoulder": ghost_shoulder,
@@ -372,10 +377,13 @@ def after_simulation_step(
 		_esn.W_out += np.outer(error, gain)           # (n_out, N_aug) rank-1 correction
 		_esn_P = (_esn_P - np.outer(gain, Pp)) / ESN_RLS_LAMBDA
 		_esn_rls_n += 1
-		# Mark this learning event on the error plot (climbing-fiber tick).
+		# Mark this learning event on all subplots (climbing-fiber tick).
 		if _MPLOT_OK:
 			try:
-				_esn_err_ax.axvline(t_now, color="cyan", lw=0.5, alpha=0.25)
+				for _ax in _esn_err_axes:
+					_ax.axvline(t_now, color="cyan", lw=0.5, alpha=0.25)
+				_esn_ee_ax.axvline(t_now, color="cyan", lw=0.5, alpha=0.25)
+				_esn_err_fig.canvas.draw_idle()
 				_esn_err_fig.canvas.draw_idle()
 			except Exception:
 				pass
@@ -399,11 +407,13 @@ def after_simulation_step(
 				)
 				if _MPLOT_OK:
 					try:
-						_esn_err_ax.axvline(
-							t_now, color="lime", ls="--", lw=1.5,
-							label=f"Converged t={t_now:.1f}s",
-						)
-						_esn_err_ax.legend(loc="upper right")
+						for _axi, _ax in enumerate(_esn_err_axes):
+							_ax.axvline(t_now, color="lime", ls="--", lw=1.5,
+							            label=f"Converged t={t_now:.1f}s" if _axi == 0 else None)
+							_ax.legend(loc="upper right", fontsize=7)
+						_esn_ee_ax.axvline(t_now, color="lime", ls="--", lw=1.5)
+						_esn_err_fig.canvas.draw_idle()
+						_esn_err_fig.canvas.flush_events()
 						_esn_err_fig.canvas.draw_idle()
 						_esn_err_fig.canvas.flush_events()
 					except Exception:
@@ -412,17 +422,44 @@ def after_simulation_step(
 			_esn_conv_count = 0   # error spiked — reset counter, keep learning
 
 	# ── Real-time error plot ──────────────────────────────────────────────────
+	ee_pos_now   = current_state_snapshot.get("end_effector_pos_ground", np.zeros(3))
+	ee_ghost_err = float(np.linalg.norm(ee_pos_now - _last_ghost_hand))   # metres
+
 	_esn_err_t.append(t_now)
 	_esn_err_q.append(q_err_mag)
 	_esn_err_qd.append(qd_err_mag)
+	_esn_err_ee.append(ee_ghost_err)
+
+	# Per-joint: what the cerebellum predicted vs what actually happened.
+	for _ji, _cn in enumerate(coord_names):
+		_esn_actual_per_coord[_ji].append(float(q_now.get(_cn, 0.0)))
+		_esn_pred_per_coord[_ji].append(float(_esn_last_pred[_ji]))
 
 	if _MPLOT_OK and _esn_step_count % ESN_PLOT_INTERVAL == 0:
-		_esn_line_q.set_xdata(_esn_err_t)
-		_esn_line_q.set_ydata(_esn_err_q)
-		_esn_line_qd.set_xdata(_esn_err_t)
-		_esn_line_qd.set_ydata(_esn_err_qd)
-		_esn_err_ax.relim()
-		_esn_err_ax.autoscale_view(scalex=True, scaley=True)
+		for _ji in range(len(coord_names)):
+			_esn_lines_actual[_ji].set_xdata(_esn_err_t)
+			_esn_lines_actual[_ji].set_ydata(_esn_actual_per_coord[_ji])
+			_esn_lines_pred[_ji].set_xdata(_esn_err_t)
+			_esn_lines_pred[_ji].set_ydata(_esn_pred_per_coord[_ji])
+			_esn_err_axes[_ji].relim()
+			_esn_err_axes[_ji].autoscale_view(scalex=True, scaley=True)
+		_esn_line_ee.set_xdata(_esn_err_t)
+		_esn_line_ee.set_ydata(_esn_err_ee)
+		_esn_ee_ax.relim()
+		_esn_ee_ax.autoscale_view(scalex=True, scaley=True)
+		# Drain keyboard-thread plot events (must happen on main thread).
+		while not _plot_event_queue.empty():
+			try:
+				ev = _plot_event_queue.get_nowait()
+				for _axi, _ax in enumerate(_esn_err_axes):
+					_ax.axvline(t_now, color=ev["color"], ls=ev["ls"],
+					            lw=ev["lw"], alpha=ev["alpha"],
+					            label=ev["label"] if _axi == 0 else None)
+					_ax.legend(loc="upper right", fontsize=7)
+				_esn_ee_ax.axvline(t_now, color=ev["color"], ls=ev["ls"],
+				                   lw=ev["lw"], alpha=ev["alpha"])
+			except Exception:
+				pass
 		try:
 			_esn_err_fig.canvas.draw_idle()
 			_esn_err_fig.canvas.flush_events()
@@ -1014,6 +1051,9 @@ Kd = {"shoulder_elv": 28.0,  "elbow_flexion": 14.0}
 Ki = {"shoulder_elv": 15.0,  "elbow_flexion": 8.0}   # integral: kills gravity offset
 # Anti-windup: clamp the accumulated integral (in rad·s) to this value.
 KI_MAX = {"shoulder_elv": 3.0, "elbow_flexion": 2.0}
+# Baseline Kd values — used by [ / ] keys to halve / restore damping at runtime.
+_Kd_baseline = dict(Kd)   # snapshot taken once; reset target for ] key
+_Kd_low      = {cn: v * 0.15 for cn, v in Kd.items()}   # ~85% reduction → oscillatory
 
 # ── Initial target ────────────────────────────────────────────────────────────
 ee_body = _pick_end_effector_body(model)
@@ -1193,33 +1233,74 @@ print(
 
 # ── Real-time error plot ───────────────────────────────────────────────────────
 _esn_err_t:   list[float] = []
-_esn_err_q:   list[float] = []
+_esn_err_q:   list[float] = []    # kept for threshold-gate logic
 _esn_err_qd:  list[float] = []
+_esn_err_ee:  list[float] = []    # ||ghost_hand − real_hand||  (m)
+# Per-joint predicted vs actual — list-of-lists indexed by coord index.
+_esn_pred_per_coord:   list[list[float]] = [[] for _ in coord_names]
+_esn_actual_per_coord: list[list[float]] = [[] for _ in coord_names]
+# Last ghost hand position in Ground frame — set by on_simulation_step each step.
+_last_ghost_hand: np.ndarray = np.zeros(3)
+
+# Colours for the two joints — extend if more joints are added.
+_JOINT_COLORS = ["royalblue", "darkorange", "limegreen", "violet"]
 
 if _MPLOT_OK:
 	plt.ion()
-	_esn_err_fig, _esn_err_ax = plt.subplots(figsize=(9, 4))
-	_esn_err_fig.canvas.manager.set_window_title("ESN Online Learning — Prediction Error")
-	_esn_line_q,  = _esn_err_ax.plot([], [], lw=1.2, color="royalblue",  label="||Δq||  (rad)")
-	_esn_line_qd, = _esn_err_ax.plot([], [], lw=1.2, color="darkorange", label="||Δqd|| (rad/s)", alpha=0.7)
-	# Horizontal line showing the learning threshold — RLS fires only above this.
-	_esn_err_ax.axhline(ESN_ERROR_LEARN_THRESH, color="cyan", lw=1.0, ls=":",
-	                    alpha=0.7, label=f"Learn thresh ({ESN_ERROR_LEARN_THRESH} rad)")
-	_esn_err_ax.set_xlabel("Simulation time (s)")
-	_esn_err_ax.set_ylabel("Prediction error magnitude")
-	_esn_err_ax.set_title("ESN one-step-ahead error  (↓ = learning)  |  cyan ticks = RLS update fired")
-	_esn_err_ax.legend(loc="upper right", fontsize=7)
-	_esn_err_ax.set_xlim(0, MAX_SIM_TIME_S)
+
+	# ── Single window: one row per joint + bottom row for EE distance ─────────
+	_n_joints = len(coord_names)
+	_n_rows   = _n_joints + 1
+	_esn_err_fig, _all_axes = plt.subplots(
+		_n_rows, 1, figsize=(10, 3 * _n_rows), sharex=True
+	)
+	_esn_err_fig.canvas.manager.set_window_title("ESN Cerebellum — Prediction Monitor")
+
+	_esn_err_axes = list(_all_axes[:_n_joints])
+	_esn_ee_ax    = _all_axes[_n_joints]
+
+	# Joint rows — solid = actual, dashed = predicted.
+	_esn_lines_actual = []
+	_esn_lines_pred   = []
+	for _ji, (_cn, _ax) in enumerate(zip(coord_names, _esn_err_axes)):
+		_col = _JOINT_COLORS[_ji % len(_JOINT_COLORS)]
+		_la, = _ax.plot([], [], lw=1.4, color=_col,          label=f"actual  {_cn} (rad)")
+		_lp, = _ax.plot([], [], lw=1.2, color=_col, ls="--", label=f"predicted {_cn} (rad)", alpha=0.7)
+		_esn_lines_actual.append(_la)
+		_esn_lines_pred.append(_lp)
+		_ax.axhline(0, color="grey", lw=0.5, alpha=0.4)
+		_ax.set_ylabel("Angle (rad)", fontsize=8)
+		_ax.legend(loc="upper right", fontsize=7)
+		_ax.set_xlim(0, MAX_SIM_TIME_S)
+
+	# Bottom row — Cartesian ghost-hand vs real-hand distance.
+	_esn_line_ee, = _esn_ee_ax.plot([], [], lw=1.5, color="limegreen",
+	                                  label="||ghost − real hand|| (m)")
+	_esn_ee_ax.set_ylabel("Distance (m)", fontsize=8)
+	_esn_ee_ax.set_xlabel("Simulation time (s)")
+	_esn_ee_ax.legend(loc="upper right", fontsize=7)
+	_esn_ee_ax.set_xlim(0, MAX_SIM_TIME_S)
+
+	_esn_err_fig.suptitle(
+		"Cerebellum: predicted (dashed) vs actual (solid)  |  cyan=RLS  orange=reach  red=stop",
+		fontsize=8,
+	)
 	_esn_err_fig.tight_layout()
+
+	_esn_err_ax = _esn_err_axes[0]   # alias for single-ax axvline helpers
+	_esn_ee_fig = _esn_err_fig        # same figure
+
 	try:
 		_esn_err_fig.canvas.draw()
 		_esn_err_fig.canvas.flush_events()
 	except Exception:
 		pass
-	print("[ESN] Matplotlib error window opened.", flush=True)
+	print("[ESN] Matplotlib prediction monitor opened.", flush=True)
 else:
 	# Placeholders so after_simulation_step references don't raise NameError.
-	_esn_err_fig = _esn_err_ax = _esn_line_q = _esn_line_qd = None
+	_esn_err_fig = _esn_err_ax = _esn_err_axes = _esn_ee_fig = _esn_ee_ax = None
+	_esn_lines_actual = _esn_lines_pred = []
+	_esn_line_q = _esn_line_qd = _esn_line_ee = None
 	print("[ESN] Matplotlib unavailable — error plot disabled.", flush=True)
 
 targets_completed = 0
@@ -1233,7 +1314,9 @@ integral_err: dict[str, float] = {cn: 0.0 for cn in coord_names}
 # ── Keyboard listener for wrist perturbation ──────────────────────────────────
 if _PYNPUT_OK:
     def _on_press(key):
-        global _perturb_active, _perturb_force
+        global _perturb_active, _perturb_force, Kd, _esn_err_ax, _esn_err_fig
+
+        # SPACE — apply random wrist force
         if key == _pynput_kb.Key.space and not _perturb_active:
             direction = np.random.randn(3)
             direction /= np.linalg.norm(direction)
@@ -1241,6 +1324,20 @@ if _PYNPUT_OK:
                 _perturb_force  = direction * PERTURBATION_FORCE_N
                 _perturb_active = True
             print(f"[PERTURB] ON  F={_perturb_force.round(1)}", flush=True)
+
+        # [ — drop damping to oscillatory regime
+        elif hasattr(key, 'char') and key.char == '[':
+            Kd.update(_Kd_low)
+            print(f"[DAMPING] LOW  Kd={list(Kd.values())}", flush=True)
+            _plot_event_queue.put({"color": "magenta", "ls": "-.", "lw": 1.5,
+                                   "alpha": 0.8, "label": "Damping LOW"})
+
+        # ] — restore baseline damping
+        elif hasattr(key, 'char') and key.char == ']':
+            Kd.update(_Kd_baseline)
+            print(f"[DAMPING] RESTORED  Kd={list(Kd.values())}", flush=True)
+            _plot_event_queue.put({"color": "violet", "ls": "-.", "lw": 1.5,
+                                   "alpha": 0.8, "label": "Damping RESTORED"})
 
     def _on_release(key):
         global _perturb_active, _perturb_force
@@ -1253,7 +1350,7 @@ if _PYNPUT_OK:
     _kb_listener = _pynput_kb.Listener(on_press=_on_press, on_release=_on_release,
                                         daemon=True)
     _kb_listener.start()
-    print("[PERTURB] Keyboard listener active — hold SPACE to apply wrist force.", flush=True)
+    print("[PERTURB] Keyboard active — SPACE: wrist force  |  [: low damping  |  ]: restore", flush=True)
 else:
     print("[PERTURB] pynput not available — keyboard perturbation disabled.", flush=True)
 
@@ -1408,11 +1505,15 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 		new_dist = float(np.linalg.norm(ee_pos - target_pos_seg))
 		t_reach  = float(state.getTime())
 
-		# ── Mark reach on error plot ──────────────────────────────────────────
+		# ── Mark reach on all plots ───────────────────────────────────────────
 		if _MPLOT_OK:
 			try:
-				_esn_err_ax.axvline(t_reach, color="orange", lw=0.8, alpha=0.6,
-				                    label=f"reach" if targets_completed == 1 else None)
+				for _axi, _ax in enumerate(_esn_err_axes):
+					_lbl = "reach" if (targets_completed == 1 and _axi == 0) else None
+					_ax.axvline(t_reach, color="orange", lw=0.8, alpha=0.6, label=_lbl)
+				_esn_ee_ax.axvline(t_reach, color="orange", lw=0.8, alpha=0.6)
+				_esn_err_fig.canvas.draw_idle()
+				_esn_err_fig.canvas.flush_events()
 				_esn_err_fig.canvas.draw_idle()
 				_esn_err_fig.canvas.flush_events()
 			except Exception:
@@ -1428,9 +1529,15 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 			)
 			if _MPLOT_OK:
 				try:
-					_esn_err_ax.axvline(t_reach, color="red", lw=2.0, ls="--",
-					                    label=f"Learning stopped (reach {targets_completed})")
-					_esn_err_ax.legend(loc="upper right", fontsize=7)
+					_stop_lbl = f"Learning stopped (reach {targets_completed})"
+					for _axi, _ax in enumerate(_esn_err_axes):
+						_ax.axvline(t_reach, color="red", lw=2.0, ls="--",
+						            label=_stop_lbl if _axi == 0 else None)
+						_ax.legend(loc="upper right", fontsize=7)
+					_esn_ee_ax.axvline(t_reach, color="red", lw=2.0, ls="--", label=_stop_lbl)
+					_esn_ee_ax.legend(loc="upper right", fontsize=7)
+					_esn_err_fig.canvas.draw_idle()
+					_esn_err_fig.canvas.flush_events()
 					_esn_err_fig.canvas.draw_idle()
 					_esn_err_fig.canvas.flush_events()
 				except Exception:
