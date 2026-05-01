@@ -124,24 +124,29 @@ GROUND_MOBOD_IX = 0
 # ── ESN forward predictive model ──────────────────────────────────────────────
 # Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
 # Output          : predicted q_next[2] + qd_next[2]             =  4 features
-ESN_N_RESERVOIR   = 1_000         # reservoir nodes
-ESN_WASHOUT_STEPS = 100          # skip updates while reservoir settles
+ESN_N_RESERVOIR   = 2_000         # reservoir nodes
+ESN_WASHOUT_STEPS = 100           # skip updates while reservoir settles
 # ── Online RLS (Recursive Least Squares) parameters ───────────────────────────
 # W_out is updated after EVERY step via the Sherman-Morrison rank-1 update on
 # P = (ΦᵀΦ)⁻¹, giving the exact optimal readout at all times with no batch solve.
-ESN_RLS_LAMBDA    = 0.999   # forgetting factor  (1 = no forgetting, <1 = exponential decay)
-ESN_RLS_DELTA     = 1e4     # initial P = delta·I  (high → fast early learning)
-ESN_RLS_WARMUP    = 200     # show ghost at real arm for this many RLS steps before trusting W_out
+ESN_RLS_LAMBDA        = 0.999  # forgetting factor  (1 = no forgetting, <1 = exponential decay)
+ESN_RLS_DELTA         = 1e4    # initial P = delta·I  (high → fast early learning)
+ESN_RLS_WARMUP        = 100     # show ghost at real arm for this many steps before trusting W_out
+# Prediction horizon: ESN predicts q(t + K·dt) from state at t.
+# K=1 → one step ahead (5 ms).  K=20 → 0.1 s ahead.  K=100 → 0.5 s ahead.
+# The ghost arm shows where the network thinks the arm will be in K steps.
+# Error is measured against the actual state K steps later (requires a K-deep buffer).
+ESN_PREDICT_HORIZON   = 1     # steps ahead to predict (K) — 1 × 0.005 s = 5 ms
+# Closed-loop mode: after this many reaches, the ESN feeds its own predicted (q, qd)
+# back as proprioceptive input instead of the real arm state.  The ghost then runs
+# autonomously — a direct test of whether the model captured the arm's dynamics.
+# tau and q_goal still come from the real arm (efference copy + goal always provided).
+ESN_CLOSED_LOOP_REACHES = 10  # switch to closed-loop after this many reaches (0 = never)
 # Per-target washout: skip RLS updates for this many steps after a new target so
 # the high-velocity transition spike doesn't corrupt P.
 ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
-ESN_LEARN_STOP_REACHES    = 1    # freeze W_out / P after this many successful reaches
-# Threshold-gated learning: RLS update only fires when ||Δq|| exceeds this value.
-# Below the threshold the model runs pure inference (no weight change).
-# Maps to inferior-olive / climbing-fiber signal in the cerebellum.
-ESN_ERROR_LEARN_THRESH    = 0.05  # rad (~3°) — tune lower to learn more, higher for less
 # Plot update rate (green milestone lines are now replaced by convergence line only).
-ESN_PLOT_INTERVAL = 40            # redraw error plot every N steps
+ESN_PLOT_INTERVAL = 40             # redraw error plot every N steps
 # Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
 ESN_CONVERGENCE_Q_THRESH = 0.03   # rad (~1.7°)
 ESN_CONVERGENCE_WINDOW   = 400    # consecutive steps below threshold
@@ -164,7 +169,7 @@ COORD_ACTUATOR_OPTIMAL_FORCE = {
 	"shoulder_elv": 1.0,
 	"elbow_flexion": 1.0,
 }
-MAX_SIM_TIME_S = 45.0
+MAX_SIM_TIME_S = float("inf")  # run forever (stop manually with Ctrl+C)
 RNG_SEED = 1
 
 # Hard torque limits (Nm). Prevents numerical blow-up.
@@ -279,7 +284,8 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 	    "ghost_shoulder", "ghost_elbow", "ghost_hand"  – np.ndarray[3] positions
 	    that drive the blue ESN-predicted ghost stick figure.
 	"""
-	global _esn_r, _esn_r_at_pred, _esn_last_pred, _esn_step_count, _last_ghost_hand
+	global _esn_r, _esn_r_at_pred, _esn_last_pred, _esn_step_count, _last_ghost_hand, \
+	       _esn_cl_q, _esn_cl_qd
 
 	q      = state_snapshot["q"]
 	qd     = state_snapshot["qd"]
@@ -289,23 +295,43 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 	n_coords = len(coord_names)
 
 	# ── Cerebellum forward model ──────────────────────────────────────────────
-	# Input: current real state (q, qd, qdd) + efference copy (tau) + goal.
-	# Output: one-step-ahead prediction of next (q, qd).
-	# The prediction is the ghost arm position — no coupling to the real arm
-	# except when W_out is re-solved (climbing-fiber correction, green lines).
-	u      = _build_esn_input_vec(q, qd, qdd, tau, q_goal)
+	# Open-loop: real arm state → predict q(t+K).
+	# Closed-loop: ESN's own last prediction replaces real q/qd as proprioceptive
+	#   input.  tau and q_goal still come from the real arm (efference + goal).
+	#   This tests whether the model captured the dynamics autonomously.
+	if _esn_closed_loop:
+		q_in  = {cn: float(_esn_cl_q[i])  for i, cn in enumerate(coord_names)}
+		qd_in = {cn: float(_esn_cl_qd[i]) for i, cn in enumerate(coord_names)}
+	else:
+		q_in  = q
+		qd_in = qd
+
+	u      = _build_esn_input_vec(q_in, qd_in, qdd, tau, q_goal)
 	_esn_r = _esn.step(_esn_r, u)
-	_esn_r_at_pred = _esn_r.copy()
 	_esn_last_pred = _esn._readout(_esn_r).copy()
 	_esn_step_count += 1
 
+	# Update closed-loop state from the latest prediction.
+	if _esn_closed_loop:
+		_esn_cl_q  = _esn_last_pred[:n_coords].copy()
+		_esn_cl_qd = _esn_last_pred[n_coords:].copy() / _ESN_QD_SCALE  # undo dt scaling
+
+	# Push (reservoir snapshot, prediction) into the horizon buffer.
+	# after_simulation_step reads the oldest entry (made K steps ago) for the RLS error.
+	_esn_horizon_buf.append((_esn_r.copy(), _esn_last_pred.copy()))
+
+	# Expose the K-step-old snapshot for after_simulation_step's RLS update.
+	if len(_esn_horizon_buf) == ESN_PREDICT_HORIZON:
+		_esn_r_at_pred, _ = _esn_horizon_buf[0]   # oldest = made K steps ago
+
 	# ── Ghost arm FK ──────────────────────────────────────────────────────────
-	# Before the first W_out solve (buffer still filling) W_out ≈ 0 so pred ≈ 0.
-	# Show ghost at real arm until training has begun so the figure is sensible.
 	q_actual_arr = np.array([q.get(cn, 0.0) for cn in coord_names])
-	if _esn_rls_n < ESN_RLS_WARMUP or _esn_target_washout_rem > 0:
-		# Not yet trained, OR reservoir is settling into new target context —
-		# pin ghost to real arm so there is no wild jump in the visualizer.
+	if _esn_closed_loop:
+		# Closed-loop: cerebellum has its own autonomous state — NEVER snap to
+		# the real arm.  The divergence between ghost and skeleton is the signal.
+		pred_q_arr = _esn_cl_q.copy()
+	elif _esn_step_count <= ESN_WASHOUT_STEPS + ESN_RLS_WARMUP or _esn_target_washout_rem > 0:
+		# Open-loop warmup / per-target washout: pin to real arm until W_out is ready.
 		pred_q_arr = q_actual_arr
 	else:
 		pred_q_arr = _esn_last_pred[:n_coords]
@@ -345,48 +371,43 @@ def after_simulation_step(
 	    "qd"  – {coord_name: rad/s}
 	    "end_effector_pos_ground" – np.ndarray
 	"""
-	global _esn_frozen, _esn_conv_count, _esn_err_ema_q, _esn_P, _esn_rls_n, _esn_target_washout_rem, _esn_learning_stopped
+	global _esn_frozen, _esn_conv_count, _esn_err_ema_q, _esn_P, _esn_rls_n, \
+	       _esn_target_washout_rem
 
 	# Skip everything during the initial washout (reservoir settling period).
 	if _esn_step_count <= ESN_WASHOUT_STEPS:
 		return
 
-	# Ground-truth next state
+	# Ground-truth state at t_now (= t + K·dt relative to the prediction made K steps ago).
 	q_now  = current_state_snapshot["q"]
 	qd_now = current_state_snapshot["qd"]
 	actual = _build_esn_target_vec(q_now, qd_now)   # shape (4,)
 
-	# Prediction error: positive → ESN undershot, negative → overshot.
-	error = actual - _esn_last_pred                  # shape (4,)
+	# Use the K-step-old prediction for the error (horizon buffer must be full).
+	if len(_esn_horizon_buf) < ESN_PREDICT_HORIZON:
+		return
+	_r_k_ago, _pred_k_ago = _esn_horizon_buf[0]
+
+	# Prediction error
+	error = actual - _pred_k_ago                     # shape (4,)
 
 	n          = len(coord_names)
-	q_err_mag  = float(np.linalg.norm(error[:n]))                      # ||Δq||  (rad)
-	qd_err_mag = float(np.linalg.norm(error[n:]) / _ESN_QD_SCALE)     # ||Δqd|| (rad/s, unscaled for display)
+	q_err_mag  = float(np.linalg.norm(error[:n]))
+	qd_err_mag = float(np.linalg.norm(error[n:]) / _ESN_QD_SCALE)
 
-	# ── Threshold-gated RLS update (climbing-fiber model) ────────────────────
-	# Mirrors the inferior olive → climbing fiber pathway: the update only fires
-	# when the prediction error exceeds ESN_ERROR_LEARN_THRESH.  Below that the
-	# cerebellum runs pure inference with no weight change.
+	# ── RLS update — runs every step in open-loop, never in closed-loop ───────
+	# Learning is simply tied to whether we are in closed-loop or not.
+	# No threshold gating, no hysteresis — just continuous fitting while open.
 	if _esn_target_washout_rem > 0:
 		_esn_target_washout_rem -= 1   # suppress spike data near target transitions
-	elif not _esn_learning_stopped and q_err_mag > ESN_ERROR_LEARN_THRESH:
-		phi  = _esn._augment(_esn_r_at_pred)          # (N_aug,)
-		Pp   = _esn_P @ phi                           # (N_aug,)
-		denom = ESN_RLS_LAMBDA + float(phi @ Pp)      # scalar
-		gain  = Pp / denom                            # (N_aug,)
-		_esn.W_out += np.outer(error, gain)           # (n_out, N_aug) rank-1 correction
+	elif not _esn_closed_loop:
+		phi  = _esn._augment(_r_k_ago)
+		Pp   = _esn_P @ phi
+		denom = ESN_RLS_LAMBDA + float(phi @ Pp)
+		gain  = Pp / denom
+		_esn.W_out += np.outer(error, gain)
 		_esn_P = (_esn_P - np.outer(gain, Pp)) / ESN_RLS_LAMBDA
 		_esn_rls_n += 1
-		# Mark this learning event on all subplots (climbing-fiber tick).
-		if _MPLOT_OK:
-			try:
-				for _ax in _esn_err_axes:
-					_ax.axvline(t_now, color="cyan", lw=0.5, alpha=0.25)
-				_esn_ee_ax.axvline(t_now, color="cyan", lw=0.5, alpha=0.25)
-				_esn_err_fig.canvas.draw_idle()
-				_esn_err_fig.canvas.draw_idle()
-			except Exception:
-				pass
 
 	# ── Convergence milestone (diagnostic only — does NOT stop learning) ───────
 	# When EMA‖Δq‖ stays below the threshold long enough, mark the milestone on
@@ -430,10 +451,10 @@ def after_simulation_step(
 	_esn_err_qd.append(qd_err_mag)
 	_esn_err_ee.append(ee_ghost_err)
 
-	# Per-joint: what the cerebellum predicted vs what actually happened.
+	# Per-joint: what the cerebellum predicted (K steps ago) vs what actually happened.
 	for _ji, _cn in enumerate(coord_names):
 		_esn_actual_per_coord[_ji].append(float(q_now.get(_cn, 0.0)))
-		_esn_pred_per_coord[_ji].append(float(_esn_last_pred[_ji]))
+		_esn_pred_per_coord[_ji].append(float(_pred_k_ago[_ji]))
 
 	if _MPLOT_OK and _esn_step_count % ESN_PLOT_INTERVAL == 0:
 		for _ji in range(len(coord_names)):
@@ -447,6 +468,12 @@ def after_simulation_step(
 		_esn_line_ee.set_ydata(_esn_err_ee)
 		_esn_ee_ax.relim()
 		_esn_ee_ax.autoscale_view(scalex=True, scaley=True)
+		# ── Reservoir snapshot ────────────────────────────────────────────────
+		try:
+			_r_snap = _esn_r[:_res_rows * _res_cols].reshape(_res_rows, _res_cols)
+			_res_im.set_data(_r_snap)
+		except Exception:
+			pass
 		# Drain keyboard-thread plot events (must happen on main thread).
 		while not _plot_event_queue.empty():
 			try:
@@ -1090,13 +1117,21 @@ print(
 def _build_esn_input_vec(
 	q: dict, qd: dict, qdd: dict, tau: dict, q_goal: dict,
 ) -> np.ndarray:
-	"""Flatten (q, qd, qdd, tau, q_goal) for each coord → length-10 ESN input."""
+	"""Flatten (q, qd, qdd, tau, q_goal, q_err) for each coord → length-12 ESN input.
+
+	q(t) is included as proprioceptive feedback — the cerebellum receives current
+	position and must predict q(t + K·dt).  This is non-trivial for K > 1 because
+	the arm moves significantly over that window, so the readout cannot simply copy
+	the current position.  ESN_PREDICT_HORIZON controls the difficulty.
+	"""
+	q_err = [q_goal.get(cn, 0.0) - q.get(cn, 0.0) for cn in coord_names]
 	return np.array(
 		[q.get(cn, 0.0)      for cn in coord_names] +
 		[qd.get(cn, 0.0)     for cn in coord_names] +
 		[qdd.get(cn, 0.0)    for cn in coord_names] +
 		[tau.get(cn, 0.0)    for cn in coord_names] +
-		[q_goal.get(cn, 0.0) for cn in coord_names],
+		[q_goal.get(cn, 0.0) for cn in coord_names] +
+		q_err,
 		dtype=float,
 	)
 
@@ -1118,7 +1153,7 @@ def _build_esn_target_vec(q: dict, qd: dict) -> np.ndarray:
 
 
 # ── ESN instance ──────────────────────────────────────────────────────────────
-_ESN_N_IN  = len(coord_names) * 5   # q + qd + qdd + tau + q_goal = 10
+_ESN_N_IN  = len(coord_names) * 6   # q + qd + qdd + tau + q_goal + q_err = 12
 _ESN_N_OUT = len(coord_names) * 2   # q_next + qd_next = 4
 
 _esn = EchoStateNetwork(
@@ -1138,9 +1173,21 @@ _esn.W_out = np.zeros((_ESN_N_OUT, 2 * ESN_N_RESERVOIR + 1))
 
 # ESN runtime state shared between on_simulation_step and after_simulation_step.
 _esn_r:          np.ndarray = np.zeros(ESN_N_RESERVOIR)  # current reservoir state
-_esn_r_at_pred:  np.ndarray = np.zeros(ESN_N_RESERVOIR)  # state at last prediction
-_esn_last_pred:  np.ndarray = np.zeros(_ESN_N_OUT)        # last prediction vector
+_esn_r_at_pred:  np.ndarray = np.zeros(ESN_N_RESERVOIR)  # state at last prediction (K steps ago)
+_esn_last_pred:  np.ndarray = np.zeros(_ESN_N_OUT)        # prediction to show on ghost (current)
 _esn_step_count: int        = 0                            # steps elapsed
+
+# Horizon buffer: holds (r_snapshot, prediction) tuples for the last K steps so that
+# after_simulation_step can compare the K-step-old prediction to the current true state.
+# maxlen=K means the oldest entry (index 0) was made exactly K steps ago.
+_esn_horizon_buf: collections.deque = collections.deque(
+    maxlen=max(1, ESN_PREDICT_HORIZON)
+)
+# Closed-loop state: when active, these replace real arm q/qd as ESN input.
+# Initialised to zeros; seeded from real arm state when closed-loop switches on.
+_esn_closed_loop: bool       = False
+_esn_cl_q:  np.ndarray       = np.zeros(2)   # predicted joint angles  (rad)
+_esn_cl_qd: np.ndarray       = np.zeros(2)   # predicted joint velocities (rad/s)
 # Convergence tracking
 _esn_frozen:     bool  = False
 _esn_conv_count: int   = 0
@@ -1156,7 +1203,7 @@ _esn_target_washout_rem: int = 0
 _N_aug    = 2 * ESN_N_RESERVOIR + 1
 _esn_P:   np.ndarray = ESN_RLS_DELTA * np.eye(_N_aug)  # high initial uncertainty
 _esn_rls_n: int          = 0
-_esn_learning_stopped: bool = False   # set True after ESN_LEARN_STOP_REACHES reaches
+_esn_learning_stopped: bool = False  # True while closed-loop or perturbation is active
 
 # ── Dedicated FK state for ESN ghost arm ──────────────────────────────────────
 # We need a state separate from _ik_state so FK evaluation (predicted q → 3D)
@@ -1248,16 +1295,27 @@ _JOINT_COLORS = ["royalblue", "darkorange", "limegreen", "violet"]
 if _MPLOT_OK:
 	plt.ion()
 
-	# ── Single window: one row per joint + bottom row for EE distance ─────────
+	# ── Single window: joints + EE distance + reservoir snapshot ─────────────
 	_n_joints = len(coord_names)
-	_n_rows   = _n_joints + 1
-	_esn_err_fig, _all_axes = plt.subplots(
-		_n_rows, 1, figsize=(10, 3 * _n_rows), sharex=True
-	)
+	_n_signal_rows = _n_joints + 1   # joint rows + EE row
+	import matplotlib.gridspec as _gs
+	_esn_err_fig = plt.figure(figsize=(10, 3 * _n_signal_rows + 2))
 	_esn_err_fig.canvas.manager.set_window_title("ESN Cerebellum — Prediction Monitor")
+	_grid = _gs.GridSpec(
+		_n_signal_rows + 1, 1,
+		figure=_esn_err_fig,
+		height_ratios=[3] * _n_signal_rows + [2],  # signal rows taller, reservoir shorter
+		hspace=0.4,
+	)
+	_all_signal_axes = [_esn_err_fig.add_subplot(_grid[i]) for i in range(_n_signal_rows)]
+	_esn_reservoir_ax = _esn_err_fig.add_subplot(_grid[_n_signal_rows])
 
-	_esn_err_axes = list(_all_axes[:_n_joints])
-	_esn_ee_ax    = _all_axes[_n_joints]
+	_esn_err_axes = _all_signal_axes[:_n_joints]
+	_esn_ee_ax    = _all_signal_axes[_n_joints]
+
+	# Share x-axis across signal rows.
+	for _ax in _esn_err_axes[1:] + [_esn_ee_ax]:
+		_ax.sharex(_esn_err_axes[0])
 
 	# Joint rows — solid = actual, dashed = predicted.
 	_esn_lines_actual = []
@@ -1271,7 +1329,7 @@ if _MPLOT_OK:
 		_ax.axhline(0, color="grey", lw=0.5, alpha=0.4)
 		_ax.set_ylabel("Angle (rad)", fontsize=8)
 		_ax.legend(loc="upper right", fontsize=7)
-		_ax.set_xlim(0, MAX_SIM_TIME_S)
+		_ax.set_xlim(0, 60)
 
 	# Bottom row — Cartesian ghost-hand vs real-hand distance.
 	_esn_line_ee, = _esn_ee_ax.plot([], [], lw=1.5, color="limegreen",
@@ -1279,13 +1337,27 @@ if _MPLOT_OK:
 	_esn_ee_ax.set_ylabel("Distance (m)", fontsize=8)
 	_esn_ee_ax.set_xlabel("Simulation time (s)")
 	_esn_ee_ax.legend(loc="upper right", fontsize=7)
-	_esn_ee_ax.set_xlim(0, MAX_SIM_TIME_S)
+	_esn_ee_ax.set_xlim(0, 60)
+
+	# Reservoir snapshot — reshape flat vector into 2D grid for imshow.
+	# 2000 neurons → 40 rows × 50 cols (adjust if ESN_N_RESERVOIR changes).
+	_res_rows = 40
+	_res_cols = ESN_N_RESERVOIR // _res_rows   # e.g. 50 for N=2000
+	_res_img_data = np.zeros((_res_rows, _res_cols))
+	_res_im = _esn_reservoir_ax.imshow(
+		_res_img_data, aspect="auto", cmap="RdBu_r",
+		vmin=-1.0, vmax=1.0, interpolation="nearest",
+	)
+	_esn_err_fig.colorbar(_res_im, ax=_esn_reservoir_ax, fraction=0.02, pad=0.02)
+	_esn_reservoir_ax.set_title("Reservoir state  (tanh activations)", fontsize=8)
+	_esn_reservoir_ax.set_xlabel("Neuron index →", fontsize=7)
+	_esn_reservoir_ax.set_ylabel("Row", fontsize=7)
+	_esn_reservoir_ax.tick_params(labelsize=6)
 
 	_esn_err_fig.suptitle(
-		"Cerebellum: predicted (dashed) vs actual (solid)  |  cyan=RLS  orange=reach  red=stop",
+		"Cerebellum: predicted (dashed) vs actual (solid)  |  cyan=RLS  orange=reach",
 		fontsize=8,
 	)
-	_esn_err_fig.tight_layout()
 
 	_esn_err_ax = _esn_err_axes[0]   # alias for single-ax axvline helpers
 	_esn_ee_fig = _esn_err_fig        # same figure
@@ -1301,6 +1373,9 @@ else:
 	_esn_err_fig = _esn_err_ax = _esn_err_axes = _esn_ee_fig = _esn_ee_ax = None
 	_esn_lines_actual = _esn_lines_pred = []
 	_esn_line_q = _esn_line_qd = _esn_line_ee = None
+	_res_im = None
+	_res_rows = 40
+	_res_cols = ESN_N_RESERVOIR // _res_rows
 	print("[ESN] Matplotlib unavailable — error plot disabled.", flush=True)
 
 targets_completed = 0
@@ -1315,37 +1390,59 @@ integral_err: dict[str, float] = {cn: 0.0 for cn in coord_names}
 if _PYNPUT_OK:
     def _on_press(key):
         global _perturb_active, _perturb_force, Kd, _esn_err_ax, _esn_err_fig
+        global _esn_learning_stopped, _esn_closed_loop, _esn_cl_q, _esn_cl_qd
 
-        # SPACE — apply random wrist force
+        # SPACE — apply random wrist force, freeze weights, AND switch to closed-loop.
+        # Closed-loop means the ghost feeds its own predictions as input — it stops
+        # tracking the real arm and runs its own autonomous trajectory.
+        # The gap between ghost (intended) and real arm (perturbed) is the error signal.
+        # Weights unfreeze and open-loop resumes when SPACE is released.
         if key == _pynput_kb.Key.space and not _perturb_active:
             direction = np.random.randn(3)
             direction /= np.linalg.norm(direction)
             with _perturb_lock:
                 _perturb_force  = direction * PERTURBATION_FORCE_N
                 _perturb_active = True
-            print(f"[PERTURB] ON  F={_perturb_force.round(1)}", flush=True)
+            _esn_learning_stopped = True   # protect model from perturbed data
+            # Switch ghost to closed-loop, seeded from last ESN prediction.
+            if not _esn_closed_loop:
+                _esn_closed_loop = True
+                _esn_cl_q  = _esn_last_pred[:len(coord_names)].copy()
+                _esn_cl_qd = (_esn_last_pred[len(coord_names):].copy() / _ESN_QD_SCALE)
+            print(f"[PERTURB] ON  F={_perturb_force.round(1)}  |  ESN CLOSED-LOOP + weights FROZEN", flush=True)
+            _plot_event_queue.put({"color": "yellow", "ls": "-", "lw": 1.2,
+                                   "alpha": 0.8, "label": "Perturb ON (closed-loop)"})
 
-        # [ — drop damping to oscillatory regime
+        # [ — drop damping + freeze weights so oscillatory data doesn't corrupt model.
         elif hasattr(key, 'char') and key.char == '[':
             Kd.update(_Kd_low)
-            print(f"[DAMPING] LOW  Kd={list(Kd.values())}", flush=True)
+            _esn_learning_stopped = True
+            print(f"[DAMPING] LOW  Kd={list(Kd.values())}  |  ESN weights FROZEN", flush=True)
             _plot_event_queue.put({"color": "magenta", "ls": "-.", "lw": 1.5,
-                                   "alpha": 0.8, "label": "Damping LOW"})
+                                   "alpha": 0.8, "label": "Damping LOW (frozen)"})
 
-        # ] — restore baseline damping
+        # ] — restore baseline damping + unfreeze (unless closed-loop locked it).
         elif hasattr(key, 'char') and key.char == ']':
             Kd.update(_Kd_baseline)
+            if not _esn_closed_loop:
+                _esn_learning_stopped = False
             print(f"[DAMPING] RESTORED  Kd={list(Kd.values())}", flush=True)
             _plot_event_queue.put({"color": "violet", "ls": "-.", "lw": 1.5,
                                    "alpha": 0.8, "label": "Damping RESTORED"})
 
     def _on_release(key):
-        global _perturb_active, _perturb_force
+        global _perturb_active, _perturb_force, _esn_learning_stopped, _esn_closed_loop
         if key == _pynput_kb.Key.space:
             with _perturb_lock:
                 _perturb_active = False
                 _perturb_force  = np.zeros(3)
-            print("[PERTURB] OFF", flush=True)
+            # Exit SPACE-triggered closed-loop; stay closed if reach-count latched it.
+            if _esn_closed_loop and targets_completed < ESN_CLOSED_LOOP_REACHES:
+                _esn_closed_loop      = False
+                _esn_learning_stopped = False   # back to open-loop → resume learning
+            print(f"[PERTURB] OFF  |  closed-loop={_esn_closed_loop}", flush=True)
+            _plot_event_queue.put({"color": "yellow", "ls": ":", "lw": 1.0,
+                                   "alpha": 0.6, "label": "Perturb OFF"})
 
     _kb_listener = _pynput_kb.Listener(on_press=_on_press, on_release=_on_release,
                                         daemon=True)
@@ -1356,7 +1453,7 @@ else:
 
 print(
 	f"[Run] visualizer={'on' if USE_VISUALIZER else 'off'}  "
-	f"stepsize={stepsize}  max_sim_time={MAX_SIM_TIME_S}s  "
+	f"stepsize={stepsize}  max_sim_time=∞ (Ctrl+C to stop)  "
 	f"Kp={Kp}  Kd={Kd}",
 	file=sys.stdout,
 )
@@ -1519,14 +1616,32 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 			except Exception:
 				pass
 
-		# ── Freeze learning after ESN_LEARN_STOP_REACHES reaches ─────────────
-		if targets_completed >= ESN_LEARN_STOP_REACHES and not _esn_learning_stopped:
-			_esn_learning_stopped = True
+		# ── Switch to closed-loop after ESN_CLOSED_LOOP_REACHES reaches ──────
+		if ESN_CLOSED_LOOP_REACHES > 0 and targets_completed >= ESN_CLOSED_LOOP_REACHES and not _esn_closed_loop:
+			_esn_closed_loop      = True
+			_esn_learning_stopped = True   # freeze W_out — pure generalization test
+			# Seed closed-loop state from current real arm so there's no jump at switch-on.
+			_esn_cl_q  = np.array([q_cur.get(cn, 0.0) for cn in coord_names])
+			_esn_cl_qd = np.array([qd_cur.get(cn, 0.0) for cn in coord_names])
 			print(
-				f"\n[ESN] ◼ LEARNING STOPPED after {targets_completed} reaches "
-				f"at t={t_reach:.2f}s — W_out frozen, pure inference from here\n",
+				f"\n[ESN] ⟳ CLOSED-LOOP at t={t_reach:.2f}s after {targets_completed} reaches — "
+				f"W_out FROZEN — ghost runs purely on its own predictions (no more RLS)\n",
 				flush=True,
 			)
+			if _MPLOT_OK:
+				try:
+					for _ax in _esn_err_axes:
+						_ax.axvline(t_reach, color="white", lw=2.0, ls="-.",
+						            label=f"Closed-loop (reach {targets_completed})")
+						_ax.legend(loc="upper right", fontsize=7)
+					_esn_ee_ax.axvline(t_reach, color="white", lw=2.0, ls="-.")
+					_esn_err_fig.canvas.draw_idle()
+					_esn_err_fig.canvas.flush_events()
+				except Exception:
+					pass
+
+		# ── Freeze learning after ESN_LEARN_STOP_REACHES reaches ─────────────
+		# Learning stops when closed-loop activates — no separate reach-count stop needed.
 			if _MPLOT_OK:
 				try:
 					_stop_lbl = f"Learning stopped (reach {targets_completed})"
