@@ -136,7 +136,7 @@ ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
 # Maps to inferior-olive / climbing-fiber signal in the cerebellum.
 ESN_ERROR_LEARN_THRESH    = 0.05  # rad (~3°) — tune lower to learn more, higher for less
 # Plot update rate (green milestone lines are now replaced by convergence line only).
-ESN_PLOT_INTERVAL = 1             # redraw error plot every N steps
+ESN_PLOT_INTERVAL = 40             # redraw error plot every N steps
 # Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
 ESN_CONVERGENCE_Q_THRESH = 0.03   # rad (~1.7°)
 ESN_CONVERGENCE_WINDOW   = 400    # consecutive steps below threshold
