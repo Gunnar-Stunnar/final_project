@@ -175,20 +175,18 @@ TAU_LIMIT = {
 # Between updates the torque is held constant (zero-order hold).
 # The cerebellum (ESN) steps every simulation tick and receives the held torque
 # as its efference copy — predicting forward at fine resolution between coarse commands.
-PID_UPDATE_INTERVAL_MS    = 50.0    # ms — how often PID issues a new torque command (tune: 10–200 ms)
+PID_UPDATE_INTERVAL_MS    = 30.0    # ms — how often PID issues a new torque command (tune: 10–200 ms)
 
 # ── Deep Cerebellar Nuclei (DCN) feedforward torque ───────────────────────────
-# τ_DCN = K_DCN · (q_goal − pc_output)
-#   pc_output  = ESN's predicted next joint position (Purkinje cell proxy)
-#   q_goal     = current reaching target
+# τ_DCN = K_DCN_P · (q_goal − q̂)
+#   q̂ = ESN's predicted next joint position (indices [:n])
 #
-# When the cerebellum predicts the arm will reach the goal → τ_DCN ≈ 0.
-# When it predicts a shortfall → τ_DCN adds a corrective boost every tick.
-# τ_total = τ_PID + τ_DCN  (DCN contribution is capped by DCN_TAU_LIMIT).
-#
-# Set K_DCN = 0.0 to disable the cerebellar output entirely.
-K_DCN         = 10.0    # Nm/rad — cerebellum adds anticipatory torque every tick (0 = off)
-DCN_TAU_LIMIT = 75.0  # Nm    — hard cap on the DCN contribution per joint
+# Per-joint gains: shoulder_elv lifts against gravity → more authority needed.
+#                  elbow_flexion moves horizontally   → lighter touch.
+# Set a gain to 0.0 for a joint to disable its cerebellar contribution.
+K_DCN_P = {"shoulder_elv": 15.0, "elbow_flexion": 12.0}   # Nm/rad — position correction
+#K_DCN_P = {"shoulder_elv": 0.0, "elbow_flexion": 0.0}   # Nm/rad — position correction
+DCN_TAU_LIMIT = 75.0  # Nm — hard cap on DCN contribution per joint
 
 # If True and the visualizer is enabled, throttle the integration loop to real time
 # so the animation doesn't finish instantly (and doesn't look "stuck").
@@ -1433,15 +1431,16 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	)
 
 	# ── DCN feedforward torque ────────────────────────────────────────────────
-	# τ_DCN = K_DCN · (q_goal − pc_output)   applied every tick (not rate-limited).
-	# pc_output = ESN's current predicted next joint position (denormalised → rad).
+	# τ_DCN = K_DCN_P[cn] · (q_goal − q̂)   per joint, every tick.
+	# q̂ = ESN's predicted next joint position (denormalised → rad), indices [:n_c].
 	# τ_total = τ_PID_held + τ_DCN, written to actuators before integration.
-	_n_c = len(coord_names)
-	_pc_rad = _esn_last_pred[:_n_c] * _ESN_SCALE_Q   # denormalise → rad
+	_n_c    = len(coord_names)
+	_pc_rad = _esn_last_pred[:_n_c] * _ESN_SCALE_Q   # predicted position → rad
 	for _i, _cn in enumerate(coord_names):
-		if K_DCN != 0.0:
+		_kp = float(K_DCN_P.get(_cn, 0.0))
+		if _kp != 0.0:
 			_dcn_tau = float(np.clip(
-				K_DCN * (q_goal_seg[_cn] - float(_pc_rad[_i])),
+				_kp * (q_goal_seg[_cn] - float(_pc_rad[_i])),
 				-DCN_TAU_LIMIT, DCN_TAU_LIMIT,
 			))
 		else:
