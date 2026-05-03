@@ -136,7 +136,7 @@ ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
 # Maps to inferior-olive / climbing-fiber signal in the cerebellum.
 ESN_ERROR_LEARN_THRESH    = 0.05  # rad (~3°) — tune lower to learn more, higher for less
 # Plot update rate (green milestone lines are now replaced by convergence line only).
-ESN_PLOT_INTERVAL = 40             # redraw error plot every N steps
+ESN_PLOT_INTERVAL = 1              # redraw error plot every N steps
 # Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
 ESN_CONVERGENCE_Q_THRESH = 0.03   # rad (~1.7°)
 ESN_CONVERGENCE_WINDOW   = 400    # consecutive steps below threshold
@@ -185,7 +185,7 @@ PID_UPDATE_INTERVAL_MS    = 30.0    # ms — how often PID issues a new torque c
 #                  elbow_flexion moves horizontally   → lighter touch.
 # Set a gain to 0.0 for a joint to disable its cerebellar contribution.
 K_DCN_P = {"shoulder_elv": 15.0, "elbow_flexion": 12.0}   # Nm/rad — position correction
-#K_DCN_P = {"shoulder_elv": 0.0, "elbow_flexion": 0.0}   # Nm/rad — position correction
+# K_DCN_P = {"shoulder_elv": 0.0, "elbow_flexion": 0.0}   # Nm/rad — position correction
 DCN_TAU_LIMIT = 75.0  # Nm — hard cap on DCN contribution per joint
 
 # If True and the visualizer is enabled, throttle the integration loop to real time
@@ -440,6 +440,23 @@ def after_simulation_step(
 		_esn_line_qd.set_ydata(_esn_err_qd)
 		_esn_err_ax.relim()
 		_esn_err_ax.autoscale_view(scalex=True, scaley=True)
+		# Update reach-rate rolling line.
+		if _line_reach is not None:
+			try:
+				_t_now_plot = _esn_err_t[-1] if _esn_err_t else 0.0
+				_rate_now = sum(
+					1 for _rt in _reach_times
+					if _t_now_plot - REACH_RATE_WIN_S <= _rt <= _t_now_plot
+				)
+				_reach_rate_t.append(_t_now_plot)
+				_reach_rate_vals.append(float(_rate_now))
+				_line_reach.set_xdata(_reach_rate_t)
+				_line_reach.set_ydata(_reach_rate_vals)
+				_yhi = max(_reach_rate_vals) if _reach_rate_vals else 1.0
+				_ax_reach.set_xlim(_esn_err_ax.get_xlim())   # mirror error-plot x range
+				_ax_reach.set_ylim(0, _yhi * 1.15)
+			except Exception:
+				pass
 		# Update reservoir heatmap with current state snapshot.
 		if _im_heat is not None:
 			try:
@@ -1226,12 +1243,18 @@ _esn_err_t:   list[float] = []
 _esn_err_q:   list[float] = []
 _esn_err_qd:  list[float] = []
 
+# Reach-rate rolling window parameters.
+REACH_RATE_WIN_S  = 5.0   # seconds — width of the trailing window used to count reaches
+_reach_times: list[float] = []        # sim-time of every successful reach
+_reach_rate_t:    list[float] = []    # sim-time of each rate sample
+_reach_rate_vals: list[float] = []    # reaches-per-30s at each sample time
+
 if _MPLOT_OK:
 	plt.ion()
-	# Two-row layout: error plot (top) + reservoir heatmap (bottom).
-	_esn_err_fig = plt.figure(figsize=(11, 6))
+	# Three-row layout: error (top) | reach-rate (middle) | reservoir heatmap (bottom).
+	_esn_err_fig = plt.figure(figsize=(11, 8))
 	_esn_err_fig.canvas.manager.set_window_title("ESN Online Learning")
-	_gs = _esn_err_fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.45)
+	_gs = _esn_err_fig.add_gridspec(3, 1, height_ratios=[3, 2, 1], hspace=0.55)
 
 	# ── Top: prediction error over time ──────────────────────────────────────
 	_esn_err_ax = _esn_err_fig.add_subplot(_gs[0])
@@ -1245,10 +1268,23 @@ if _MPLOT_OK:
 	_esn_err_ax.legend(loc="upper right", fontsize=7)
 	_esn_err_ax.set_xlim(0, 60)
 
+	# ── Middle: reach-rate rolling line ──────────────────────────────────────
+	# At each plot refresh, counts how many reaches fell in the trailing
+	# REACH_RATE_WIN_S seconds and appends a new point to a running line.
+	_ax_reach = _esn_err_fig.add_subplot(_gs[1])
+	_line_reach, = _ax_reach.plot([], [], lw=1.8, color="mediumseagreen",
+	                               label=f"Reaches / {REACH_RATE_WIN_S:.0f} s window")
+	_ax_reach.set_xlabel("Simulation time (s)", fontsize=8)
+	_ax_reach.set_ylabel(f"Reaches / {REACH_RATE_WIN_S:.0f} s", fontsize=8)
+	_ax_reach.set_title(f"Reach rate  —  trailing {REACH_RATE_WIN_S:.0f} s rolling window", fontsize=8)
+	_ax_reach.set_ylim(0, 1)   # placeholder; y rescales every update
+	_ax_reach.legend(loc="upper left", fontsize=7)
+	_ax_reach.tick_params(labelsize=7)
+
 	# ── Bottom: reservoir state snapshot (heatmap) ────────────────────────────
 	# 1500 neurons reshaped to 30×50 for display.
 	_HEAT_ROWS, _HEAT_COLS = 30, 50   # must multiply to ESN_N_RESERVOIR
-	_ax_heat = _esn_err_fig.add_subplot(_gs[1])
+	_ax_heat = _esn_err_fig.add_subplot(_gs[2])
 	_im_heat = _ax_heat.imshow(
 		np.zeros((_HEAT_ROWS, _HEAT_COLS)),
 		aspect="auto", cmap="RdBu_r", vmin=-1.0, vmax=1.0,
@@ -1266,10 +1302,11 @@ if _MPLOT_OK:
 		_esn_err_fig.canvas.flush_events()
 	except Exception:
 		pass
-	print("[ESN] Matplotlib window opened (error + reservoir heatmap).", flush=True)
+	print("[ESN] Matplotlib window opened (error + reach rate + reservoir heatmap).", flush=True)
 else:
 	# Placeholders so after_simulation_step references don't raise NameError.
 	_esn_err_fig = _esn_err_ax = _esn_line_q = _esn_line_qd = None
+	_ax_reach = _line_reach = None
 	_ax_heat = _im_heat = None
 	print("[ESN] Matplotlib unavailable — plot disabled.", flush=True)
 
@@ -1480,6 +1517,7 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	arm_settled = all(abs(qd_cur[cn]) < 0.6 for cn in coord_names)
 	if t_rel_done >= MIN_TIME_BEFORE_REACH_S and dist < REACH_TOL_M and arm_settled:
 		targets_completed += 1
+		_reach_times.append(float(state.getTime()))   # record for reach-rate histogram
 		old_target = target_pos_seg.copy()
 		# q_goal_seg from sampling = exact FK-generating angles → always reachable, residual = 0.
 		target_pos_seg, q_goal_seg = sample_one_reachable_target(
