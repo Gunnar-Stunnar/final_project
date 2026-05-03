@@ -118,9 +118,9 @@ GHOST_OPACITY = 0.35
 # Simbody Ground mobilized body index for fixed-world decorations
 GROUND_MOBOD_IX = 0
 # ── ESN forward predictive model ──────────────────────────────────────────────
-# Input per step : q[2] + qd[2] + qdd[2] + tau[2] + q_goal[2]  = 10 features
+# Input per step : q[2] + qd[2] + tau[2] + q_goal[2] + pid_wave[1]  = 9 features
 # Output          : predicted q_next[2] + qd_next[2]             =  4 features
-ESN_N_RESERVOIR   = 1500         # reservoir nodes
+ESN_N_RESERVOIR   = 3500         # reservoir nodes
 ESN_WASHOUT_STEPS = 0          # skip updates while reservoir settles
 # ── Online RLS (Recursive Least Squares) parameters ───────────────────────────
 # W_out is updated after EVERY step via the Sherman-Morrison rank-1 update on
@@ -136,7 +136,7 @@ ESN_TARGET_WASHOUT_STEPS  = 30     # ~0.15 s at dt=0.005 s
 # Maps to inferior-olive / climbing-fiber signal in the cerebellum.
 ESN_ERROR_LEARN_THRESH    = 0.05  # rad (~3°) — tune lower to learn more, higher for less
 # Plot update rate (green milestone lines are now replaced by convergence line only).
-ESN_PLOT_INTERVAL = 1              # redraw error plot every N steps
+ESN_PLOT_INTERVAL = 40              # redraw error plot every N steps
 # Convergence: mark a milestone once EMA‖Δq‖ stays below threshold for enough steps.
 ESN_CONVERGENCE_Q_THRESH = 0.03   # rad (~1.7°)
 ESN_CONVERGENCE_WINDOW   = 400    # consecutive steps below threshold
@@ -184,7 +184,7 @@ PID_UPDATE_INTERVAL_MS    = 30.0    # ms — how often PID issues a new torque c
 # Per-joint gains: shoulder_elv lifts against gravity → more authority needed.
 #                  elbow_flexion moves horizontally   → lighter touch.
 # Set a gain to 0.0 for a joint to disable its cerebellar contribution.
-K_DCN_P = {"shoulder_elv": 15.0, "elbow_flexion": 12.0}   # Nm/rad — position correction
+K_DCN_P = {"shoulder_elv": 15.0, "elbow_flexion": 10.0}   # Nm/rad — position correction
 # K_DCN_P = {"shoulder_elv": 0.0, "elbow_flexion": 0.0}   # Nm/rad — position correction
 DCN_TAU_LIMIT = 75.0  # Nm — hard cap on DCN contribution per joint
 
@@ -299,14 +299,16 @@ def on_simulation_step(t: float, state_snapshot: dict, torque_commands: dict) ->
 	qdd    = state_snapshot.get("qdd", {cn: 0.0 for cn in coord_names})
 	q_goal = state_snapshot["q_goal"]
 	tau    = {cn: torque_commands.get(f"{cn}_torque", 0.0) for cn in coord_names}
+	pid_wave = float(state_snapshot.get("pid_phase_wave", 1.0))
 	n_coords = len(coord_names)
 
 	# ── Cerebellum forward model ──────────────────────────────────────────────
-	# Input: current real state (q, qd, qdd) + efference copy (tau) + goal.
+	# Input: current real state (q, qd) + efference copy (tau) + goal
+	#        + PID-cycle phase wave (scalar, encodes when next command fires).
 	# Output: one-step-ahead prediction of next (q, qd).
 	# The prediction is the ghost arm position — no coupling to the real arm
 	# except when W_out is re-solved (climbing-fiber correction, green lines).
-	u      = _build_esn_input_vec(q, qd, qdd, tau, q_goal)
+	u      = _build_esn_input_vec(q, qd, tau, q_goal, pid_wave)
 	_esn_r = _esn.step(_esn_r, u)
 	_esn_r_at_pred = _esn_r.copy()
 	_esn_last_pred = _esn._readout(_esn_r).copy()
@@ -1100,15 +1102,21 @@ _ESN_SCALE_QERR = np.pi          # goal error     (rad)
 
 
 def _build_esn_input_vec(
-	q: dict, qd: dict, qdd: dict, tau: dict, q_goal: dict,
+	q: dict, qd: dict, tau: dict, q_goal: dict, pid_wave: float = 1.0,
 ) -> np.ndarray:
-	"""Normalised (q, qd, qdd, tau, q_goal) → length-10 ESN input in [-1, 1]."""
+	"""Normalised (q, qd, tau, q_goal, pid_wave) → length-9 ESN input in [-1, 1].
+
+	pid_wave is a smooth cosine that is 1 exactly when the PID issues a new
+	torque command, falls to 0 halfway through the inter-command interval, and
+	rises back to 1 as the next command fires.  It lets the ESN anticipate
+	the timing of motor-command updates.
+	"""
 	return np.array(
 		[q.get(cn, 0.0)      / _ESN_SCALE_Q    for cn in coord_names] +
 		[qd.get(cn, 0.0)     / _ESN_SCALE_QD   for cn in coord_names] +
-		[qdd.get(cn, 0.0)    / _ESN_SCALE_QDD  for cn in coord_names] +
 		[tau.get(cn, 0.0)    / _ESN_SCALE_TAU  for cn in coord_names] +
-		[q_goal.get(cn, 0.0) / _ESN_SCALE_Q    for cn in coord_names],
+		[q_goal.get(cn, 0.0) / _ESN_SCALE_Q    for cn in coord_names] +
+		[pid_wave],   # scalar in [0, 1]
 		dtype=float,
 	)
 
@@ -1126,7 +1134,7 @@ def _build_esn_target_vec(q: dict, qd: dict) -> np.ndarray:
 
 
 # ── ESN instance ──────────────────────────────────────────────────────────────
-_ESN_N_IN  = len(coord_names) * 5   # q + qd + qdd + tau + q_goal = 10
+_ESN_N_IN  = len(coord_names) * 4 + 1   # q + qd + tau + q_goal + pid_wave = 9
 _ESN_N_OUT = len(coord_names) * 2   # q_next + qd_next = 4
 
 _esn = EchoStateNetwork(
@@ -1283,7 +1291,7 @@ if _MPLOT_OK:
 
 	# ── Bottom: reservoir state snapshot (heatmap) ────────────────────────────
 	# 1500 neurons reshaped to 30×50 for display.
-	_HEAT_ROWS, _HEAT_COLS = 30, 50   # must multiply to ESN_N_RESERVOIR
+	_HEAT_ROWS, _HEAT_COLS = 70, 50   # must multiply to ESN_N_RESERVOIR
 	_ax_heat = _esn_err_fig.add_subplot(_gs[2])
 	_im_heat = _ax_heat.imshow(
 		np.zeros((_HEAT_ROWS, _HEAT_COLS)),
@@ -1449,11 +1457,16 @@ while float(state.getTime()) + stepsize <= MAX_SIM_TIME_S + 1e-9:
 	except Exception:
 		qdd_cur = {cn: float("nan") for cn in coord_names}
 
+	# Smooth cosine phase wave encoding where we are in the PID update cycle.
+	# 1.0 exactly when a command is issued, 0.0 halfway to the next command.
+	_pid_phase_wave = 0.5 * (np.cos(2.0 * np.pi * _pid_step_counter / _pid_update_steps) + 1.0)
+
 	state_snapshot = {
 		"q":                       q_cur,
 		"qd":                      qd_cur,
 		"qdd":                     qdd_cur,
 		"q_goal":                  dict(q_goal_seg),
+		"pid_phase_wave":          float(_pid_phase_wave),
 		"integral_err":            dict(integral_err),
 		"end_effector_pos_ground": ee_pos,
 		"shoulder_pos_ground":     shoulder_pos,
